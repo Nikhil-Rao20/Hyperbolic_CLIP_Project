@@ -32,8 +32,47 @@ MANIFEST
 *.manifest
 *.spec
 
-# Dataset
+# ─── Datasets (raw + cleaned image folders) ───
 RGIIIT/
+RGIIIT_clean/
+
+# ─── Image / binary data files ───
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.tiff
+*.tif
+*.dicom
+*.nii
+*.nii.gz
+
+# ─── Large model artifacts ───
+*.pt
+*.pth
+*.onnx
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# ─── Audit artifacts (plots, samples, logs, large CSVs) ───
+dataset_audit/plots/
+dataset_audit/samples/
+dataset_audit/logs/
+dataset_audit/reports/image_statistics.csv
+dataset_audit/reports/duplicates_report.csv
+dataset_audit/reports/mri_anomaly_report.csv
+dataset_audit/reports/data_leakage_report.csv
+dataset_audit/reports/corrupted_files_report.csv
+dataset_audit/reports/dataset_structure_report.json
+
+# ─── Allow curated README visuals (override *.png rule) ───
+!assets/
+!assets/*.png
+
+# ─── Allow metadata committed with the repo ───
+# (csv, json, md, py are NOT ignored)
 
 # Installer logs
 pip-log.txt
@@ -73,6 +112,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+docs/phase_1_dataset_preparation_detailed.md
 
 # PyBuilder
 .pybuilder/
