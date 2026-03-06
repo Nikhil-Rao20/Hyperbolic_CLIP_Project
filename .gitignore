@@ -71,6 +71,12 @@ dataset_audit/reports/dataset_structure_report.json
 !assets/
 !assets/*.png
 
+# ─── Notebooks (run on Kaggle, not committed) ───
+notebooks/*.ipynb
+
+# ─── Internal documentation (personal reference only) ───
+docs/internal/
+
 # ─── Allow metadata committed with the repo ───
 # (csv, json, md, py are NOT ignored)
 

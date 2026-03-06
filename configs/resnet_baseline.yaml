@@ -1,0 +1,24 @@
+# ResNet50 Baseline Configuration
+# =================================
+
+# Dataset
+dataset_path: "RGIIIT_clean"
+
+# Training
+batch_size: 32
+epochs: 25
+learning_rate: 3.0e-4
+weight_decay: 1.0e-4
+optimizer: "AdamW"
+num_workers: 0          # set to 2-4 on Kaggle/Linux
+
+# Augmentation (applied to train split only)
+augmentation:
+  horizontal_flip: true
+  rotation_degrees: 10
+  color_jitter:
+    brightness: 0.1
+    contrast: 0.1
+
+# Experiment output
+experiment_dir: "experiments/resnet_baseline"
