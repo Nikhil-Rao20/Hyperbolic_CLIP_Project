@@ -1,0 +1,25 @@
+# Real-Only Hyperbolic CLIP — Hyperbolic OOD Detection
+# Phase 3 experiment: one-class anomaly detection in hyperbolic space
+
+dataset_path: "RGIIIT_clean"
+clip_model_name: "openai/clip-vit-base-patch32"
+
+# Training
+batch_size: 32
+epochs: 25
+learning_rate: 1e-5
+weight_decay: 1e-4
+num_workers: 0
+
+# Hyperbolic geometry
+curvature: 1.0           # Poincaré ball curvature (c)
+scale: 0.1               # Scale before exponential map
+projection_dim: 256      # Output dimension of projection head
+
+# Anomaly detection
+threshold_percentile: 95  # Percentile of validation real scores for threshold
+
+# Output
+experiment_dir: "experiments/real_only_clip_hyperbolic"
+
+seed: 42

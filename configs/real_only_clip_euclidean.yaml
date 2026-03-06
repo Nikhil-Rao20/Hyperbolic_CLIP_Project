@@ -1,0 +1,30 @@
+# Real-Only CLIP — Euclidean OOD Detection (Deep SVDD style)
+# ===========================================================
+
+# Dataset
+dataset_path: "RGIIIT_clean"
+
+# CLIP model (HuggingFace)
+clip_model_name: "openai/clip-vit-base-patch32"
+
+# Training hyperparameters
+batch_size: 32
+epochs: 25
+learning_rate: 1.0e-5
+weight_decay: 1.0e-4
+num_workers: 0          # set to 2-4 on Kaggle/Linux
+
+# Projection head
+projection_dim: 256     # final embedding dimension
+
+# Anomaly detection threshold
+threshold_percentile: 95   # percentile of validation real scores
+
+# Center momentum (for optional center update during training)
+center_momentum: 0.0       # 0 = fixed center, >0 = EMA update
+
+# Output
+experiment_dir: "experiments/real_only_clip_euclidean"
+
+# Reproducibility
+seed: 42
