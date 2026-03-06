@@ -50,7 +50,7 @@ The dataset was cleaned (blank removal, deduplication, pHash quarantine) and spl
 
 ## Results Visualization
 
-![Model Performance Comparison](assets\model_performance_comparison.png)
+![Model Performance Comparison](assets/model_performance_comparison.png)
 
 ## Key Observations
 
