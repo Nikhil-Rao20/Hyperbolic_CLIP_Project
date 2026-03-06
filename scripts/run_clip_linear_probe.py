@@ -43,6 +43,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.datasets.mri_dataset import MRIDataset  # noqa: E402
 
 
+def _to_tensor(output):
+    """Extract tensor from CLIP output (handles both raw tensor and model output)."""
+    if isinstance(output, torch.Tensor):
+        return output
+    return output.pooler_output if hasattr(output, "pooler_output") else output[0]
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def load_config(path: str) -> dict:
@@ -88,7 +95,7 @@ def extract_embeddings(clip_model, processor, dataset, batch_size, device):
         inputs = processor(images=pil_images, return_tensors="pt", padding=True)
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        features = clip_model.get_image_features(**inputs)  # (B, 512)
+        features = _to_tensor(clip_model.get_image_features(**inputs))  # (B, 512)
         features = features / features.norm(dim=-1, keepdim=True)
 
         all_embs.append(features.cpu())

@@ -44,6 +44,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.datasets.mri_dataset import LABEL_MAP, MRIDataset  # noqa: E402
 
+
+def _to_tensor(output):
+    """Extract tensor from CLIP output (handles both raw tensor and model output)."""
+    if isinstance(output, torch.Tensor):
+        return output
+    return output.pooler_output if hasattr(output, "pooler_output") else output[0]
+
+
 # ── text prompts ─────────────────────────────────────────────────────────────
 
 PROMPT_MAP = {
@@ -217,7 +225,7 @@ def validate_zero_shot(model, processor, dataset, batch_size, device):
     prompts = [PROMPT_MAP[0], PROMPT_MAP[1]]
     text_inputs = processor(text=prompts, return_tensors="pt", padding=True)
     text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-    text_features = model.get_text_features(**text_inputs)
+    text_features = _to_tensor(model.get_text_features(**text_inputs))
     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     # text_features: (2, D) — row 0=real, row 1=fake
 
@@ -242,7 +250,7 @@ def validate_zero_shot(model, processor, dataset, batch_size, device):
         img_inputs = processor(images=pil_images, return_tensors="pt", padding=True)
         img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
 
-        image_features = model.get_image_features(**img_inputs)
+        image_features = _to_tensor(model.get_image_features(**img_inputs))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         sims = image_features @ text_features.T  # (B, 2)
@@ -334,8 +342,8 @@ def train_one_epoch(model, processor, dataloader, optimizer, scheduler,
         optimizer.zero_grad()
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            image_embeds = model.get_image_features(**img_inputs)
-            text_embeds = model.get_text_features(**txt_inputs)
+            image_embeds = _to_tensor(model.get_image_features(**img_inputs))
+            text_embeds = _to_tensor(model.get_text_features(**txt_inputs))
 
             # L2 normalise
             image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)

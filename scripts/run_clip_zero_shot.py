@@ -42,6 +42,13 @@ from src.datasets.mri_dataset import MRIDataset          # noqa: E402
 from src.utils.prompt_templates import build_text_embeddings  # noqa: E402
 
 
+def _to_tensor(output):
+    """Extract tensor from CLIP output (handles both raw tensor and model output)."""
+    if isinstance(output, torch.Tensor):
+        return output
+    return output.pooler_output if hasattr(output, "pooler_output") else output[0]
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def load_config(path: str) -> dict:
@@ -167,7 +174,7 @@ def run_zero_shot(model, processor, real_emb, fake_emb, dataset,
         inputs = processor(images=pil_images, return_tensors="pt", padding=True)
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        image_features = model.get_image_features(**inputs)  # (B, D)
+        image_features = _to_tensor(model.get_image_features(**inputs))  # (B, D)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # Cosine similarity with each class
