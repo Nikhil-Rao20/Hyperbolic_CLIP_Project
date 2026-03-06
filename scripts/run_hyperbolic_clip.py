@@ -100,6 +100,12 @@ class HyperbolicProjection(nn.Module):
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
         )
+        # Xavier uniform initialization for projection layers
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
         self.ball = geoopt.PoincareBall(c=curvature)
         self.scale = scale
 
