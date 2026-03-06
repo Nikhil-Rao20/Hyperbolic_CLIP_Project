@@ -140,7 +140,9 @@ def hyperbolic_distance(x, center, ball):
     # Expand center to match batch: (1, D)
     center_exp = center.unsqueeze(0)
     # Compute distance: ball.dist returns (N,) when shapes are (N, D) and (1, D)
-    return ball.dist(x, center_exp).squeeze(-1)
+    distances = ball.dist(x, center_exp)
+    # Ensure output is 1D (handle various geoopt return shapes)
+    return distances.view(-1)
 
 
 # ── Fréchet mean (Riemannian mean) ───────────────────────────────────────────
