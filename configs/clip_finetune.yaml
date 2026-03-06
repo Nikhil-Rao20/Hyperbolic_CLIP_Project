@@ -9,7 +9,7 @@ clip_model_name: "openai/clip-vit-base-patch32"
 
 # Training hyperparameters
 batch_size: 32
-epochs: 15
+epochs: 25
 
 # Per-component learning rates
 lr_image: 1.0e-5
