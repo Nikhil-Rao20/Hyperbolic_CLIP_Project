@@ -1,0 +1,30 @@
+# Hyperbolic CLIP — Poincaré Ball Contrastive Learning on MRI Dataset
+# ====================================================================
+
+# Dataset
+dataset_path: "RGIIIT_clean"
+
+# CLIP model (HuggingFace)
+clip_model_name: "openai/clip-vit-base-patch32"
+
+# Training hyperparameters
+batch_size: 32
+epochs: 25
+
+# Per-component learning rates
+lr_image: 1.0e-5
+lr_text: 1.0e-5
+lr_projection: 1.0e-4
+
+weight_decay: 1.0e-4
+num_workers: 0          # set to 2-4 on Kaggle/Linux
+
+# Hyperbolic geometry
+manifold_curvature: 1.0       # c parameter for PoincareBall
+scale: 0.1                    # scaling before exp_map (keeps points inside ball)
+
+# Output
+experiment_dir: "experiments/hyperbolic_clip"
+
+# Reproducibility
+seed: 42
