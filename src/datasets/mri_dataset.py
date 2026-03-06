@@ -8,7 +8,7 @@ from torchvision import transforms
 
 
 # Label mapping: real → 0, fake → 1
-LABEL_MAP = {"real": 0, "fake": 1}
+LABEL_MAP = {"Real": 0, "Fake": 1}
 
 
 def get_transforms(split: str = "train"):
@@ -53,7 +53,8 @@ class MRIDataset(Dataset):
     e.g. ``cermep__sub-0023_...`` → source = ``cermep``.
     """
 
-    def __init__(self, root: str, split: str = "train", transform=None):
+    def __init__(self, root: str, split: str = "train", transform=None,
+                 include_sources=None, exclude_sources=None):
         self.root = Path(root) / split
         self.split = split
         self.transform = transform or get_transforms(split)
@@ -65,10 +66,17 @@ class MRIDataset(Dataset):
             if not class_dir.is_dir():
                 continue
             for img_path in sorted(class_dir.glob("*.png")):
-                self.samples.append((img_path, label))
                 # Extract source from filename (text before first "__")
                 name = img_path.stem
                 source = name.split("__")[0] if "__" in name else "unknown"
+
+                # Apply source filters
+                if include_sources and source not in include_sources:
+                    continue
+                if exclude_sources and source in exclude_sources:
+                    continue
+
+                self.samples.append((img_path, label))
                 self.sources.append(source)
 
     def __len__(self):

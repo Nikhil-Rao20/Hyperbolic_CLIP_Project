@@ -71,6 +71,9 @@ dataset_audit/reports/dataset_structure_report.json
 !assets/
 !assets/*.png
 
+# ─── Experiment outputs (generated on Kaggle GPU) ───
+experiments/
+
 # ─── Notebooks (run on Kaggle, not committed) ───
 notebooks/*.ipynb
 
