@@ -6,7 +6,7 @@ dataset_path: "RGIIIT_clean"
 
 # Training hyperparameters (per fold)
 batch_size: 32
-epochs: 15
+epochs: 25
 learning_rate: 3.0e-4
 weight_decay: 1.0e-4
 optimizer: "AdamW"
