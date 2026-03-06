@@ -34,21 +34,21 @@ See [docs/phase_1_dataset_preparation.md](docs/phase_1_dataset_preparation.md) f
 
 ![Class Distribution](assets/class_distribution.png)
 
-**Resolution Distribution (before cleaning)**
+<!-- **Resolution Distribution (before cleaning)**
 
-![Resolution Distribution](assets/resolution_distribution.png)
+![Resolution Distribution](assets/resolution_distribution.png) -->
 
-**Intensity Distribution by Source**
+<!-- **Intensity Distribution by Source**
 
-![Intensity Distribution](assets/intensity_distribution.png)
+![Intensity Distribution](assets/intensity_distribution.png) -->
 
-**Sample Real MRI Slices**
+<!-- **Sample Real MRI Slices**
 
 ![Real MRI Samples](assets/sample_real_grid.png)
 
 **Sample Synthetic MRI Slices**
 
-![Synthetic MRI Samples](assets/sample_fake_grid.png)
+![Synthetic MRI Samples](assets/sample_fake_grid.png) -->
 
 ## Planned Approach (Phase 2+)
 
