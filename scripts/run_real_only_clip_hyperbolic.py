@@ -145,7 +145,7 @@ def hyperbolic_distance(x, center, ball):
 
 # ── Fréchet mean (Riemannian mean) ───────────────────────────────────────────
 
-def frechet_mean_iterative(points, ball, max_iter=100, tol=1e-7):
+def frechet_mean_iterative(points, curvature, max_iter=100, tol=1e-7):
     """Compute Fréchet mean on Poincaré ball via iterative algorithm.
 
     Uses gradient descent in the tangent space to find the point that
@@ -153,20 +153,23 @@ def frechet_mean_iterative(points, ball, max_iter=100, tol=1e-7):
 
     Parameters
     ----------
-    points : (N, D) — points on the Poincaré ball
-    ball : geoopt.PoincareBall
+    points : (N, D) — points on the Poincaré ball (any device)
+    curvature : float — Poincaré ball curvature
     max_iter : int — maximum iterations
     tol : float — convergence tolerance
 
     Returns
     -------
-    mean : (D,) — Fréchet mean point
+    mean : (D,) — Fréchet mean point (same device as input)
     """
+    # Create ball on the same device as points
+    ball = geoopt.PoincareBall(c=curvature)
+    
     # Initialize at the Euclidean mean projected onto the ball
     mean = points.mean(dim=0)
     # Project to ensure it's inside the ball (with some margin)
     mean_norm = mean.norm()
-    max_norm = 1.0 / math.sqrt(ball.c) - 1e-5
+    max_norm = 1.0 / math.sqrt(curvature) - 1e-5
     if mean_norm > max_norm:
         mean = mean * (max_norm / mean_norm)
 
@@ -270,8 +273,8 @@ def compute_hyperbolic_center(clip_model, processor, projection_head, dataset,
 
     all_embeddings = torch.cat(embeddings, dim=0)
 
-    # Compute Fréchet mean in hyperbolic space
-    center = frechet_mean_iterative(all_embeddings, projection_head.ball)
+    # Compute Fréchet mean in hyperbolic space (on CPU to avoid memory issues)
+    center = frechet_mean_iterative(all_embeddings, projection_head.curvature)
     return center
 
 
