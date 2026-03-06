@@ -216,7 +216,7 @@ def main():
 
     # ── load CLIP (frozen) ───────────────────────────────────────────────
     print("\nLoading CLIP model ...")
-    model = CLIPModel.from_pretrained(clip_model_name).to(device)
+    model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True).to(device)
     processor = CLIPProcessor.from_pretrained(clip_model_name)
     model.eval()
     for param in model.parameters():
