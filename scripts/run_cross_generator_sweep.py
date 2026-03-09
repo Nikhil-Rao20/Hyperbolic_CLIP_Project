@@ -336,7 +336,7 @@ def train_clip_experiment(model_id, train_mri, val_mri, test_mri,
     steps_per_epoch = math.ceil(len(train_ds) / batch_size)
     total_steps = epochs * steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── training loop ────────────────────────────────────────────────
     best_auroc = 0.0
@@ -356,7 +356,7 @@ def train_clip_experiment(model_id, train_mri, val_mri, test_mri,
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 image_embeds = _to_tensor(model.get_image_features(**img_inputs))
                 text_embeds = _to_tensor(model.get_text_features(**txt_inputs))
                 image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
