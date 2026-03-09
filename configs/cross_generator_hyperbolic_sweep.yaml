@@ -1,0 +1,56 @@
+# Cross-Generator × Backbone Sweep — Hyperbolic (Poincaré Ball)
+# ===============================================================
+# Same LOGO protocol as the Euclidean sweep, but with hyperbolic
+# contrastive learning (image & text projected into Poincaré Ball).
+# Only CLIP (ViT) backbones — ResNet has no text encoder for contrastive.
+
+# Dataset
+dataset_path: "RGIIIT_clean"
+
+# Generator groups (same as Euclidean sweep)
+generator_groups:
+  GAN:
+    - "GAN"
+  LDM:
+    - "LDM"
+  MLS:
+    - "MLS_CERMEP"
+    - "MLS_TCGA"
+    - "MLS_UPenn"
+
+real_sources:
+  - "cermep"
+  - "tcga"
+  - "upenn"
+
+# CLIP ViT backbones only (no ResNet — needs text encoder for hyperbolic)
+backbones:
+  - name: "ViT-B-32"
+    model_id: "openai/clip-vit-base-patch32"
+    embed_dim: 512
+
+  - name: "ViT-B-16"
+    model_id: "openai/clip-vit-base-patch16"
+    embed_dim: 512
+
+  - name: "ViT-L-14"
+    model_id: "openai/clip-vit-large-patch14"
+    embed_dim: 768
+
+# Training hyperparameters
+training:
+  batch_size: 32
+  epochs: 25
+  lr_image: 1.0e-5
+  lr_text: 1.0e-5
+  lr_projection: 1.0e-4
+  weight_decay: 1.0e-4
+
+# Hyperbolic geometry
+manifold_curvature: 1.0       # c parameter for PoincareBall
+scale: 0.1                    # scaling before exp_map (keeps points inside ball)
+
+# Common
+num_workers: 0          # set to 2-4 on Kaggle/Linux
+experiment_dir: "experiments/cross_generator_hyperbolic_sweep"
+seed: 42
