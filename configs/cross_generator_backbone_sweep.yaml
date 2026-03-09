@@ -50,7 +50,7 @@ backbones:
 # CLIP contrastive training hyperparameters
 clip_training:
   batch_size: 32
-  epochs: 15
+  epochs: 25
   lr_image: 1.0e-5
   lr_text: 1.0e-5
   lr_projection: 1.0e-4
@@ -59,7 +59,7 @@ clip_training:
 # ResNet binary classification hyperparameters
 resnet_training:
   batch_size: 32
-  epochs: 20
+  epochs: 25
   learning_rate: 3.0e-4
   weight_decay: 1.0e-4
 
