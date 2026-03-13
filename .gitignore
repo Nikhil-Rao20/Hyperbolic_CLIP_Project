@@ -79,6 +79,7 @@ notebooks/*.ipynb
 
 # ─── Internal documentation (personal reference only) ───
 docs/internal/
+docs/
 
 # ─── Allow metadata committed with the repo ───
 # (csv, json, md, py are NOT ignored)
