@@ -45,6 +45,7 @@ training:
   lr_text: 1.0e-5
   lr_projection: 1.0e-4
   weight_decay: 1.0e-4
+  warmup_epochs: 2           # linear LR ramp before cosine decay
 
 # Hyperbolic geometry
 manifold_curvature: 1.0       # c parameter for PoincareBall

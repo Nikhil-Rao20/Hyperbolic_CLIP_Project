@@ -17,6 +17,7 @@ lr_text: 1.0e-5
 lr_projection: 1.0e-4
 
 weight_decay: 1.0e-4
+warmup_epochs: 2          # linear LR ramp before cosine decay
 num_workers: 0          # set to 2-4 on Kaggle/Linux
 
 # Hyperbolic geometry

@@ -107,7 +107,8 @@ class HyperbolicProjection(nn.Module):
                 nn.init.zeros_(m.bias)
 
         self.ball = geoopt.PoincareBall(c=curvature)
-        self.scale = scale
+        # Learnable scale (MERU-style): starts at `scale`, optimised during training
+        self.scale = nn.Parameter(torch.tensor(float(scale)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Map Euclidean vectors to the Poincaré ball.
@@ -122,7 +123,8 @@ class HyperbolicProjection(nn.Module):
         """
         z_e = self.mlp(x)
         # Normalise and scale to keep vectors comfortably inside the ball
-        z_e = nn.functional.normalize(z_e, dim=-1) * self.scale
+        # .abs() keeps scale positive; value is learned during training
+        z_e = nn.functional.normalize(z_e, dim=-1) * self.scale.abs()
         # Exponential map at the origin
         z_h = self.ball.expmap0(z_e)
         return z_h
@@ -237,9 +239,16 @@ def build_optimizer(clip_model, img_proj, txt_proj, cfg):
     return geoopt.optim.RiemannianAdam(param_groups, weight_decay=wd)
 
 
-def build_scheduler(optimizer, epochs, steps_per_epoch):
+def build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs=2):
+    """Linear warmup for `warmup_epochs` then cosine decay (MERU-style)."""
     total_steps = epochs * steps_per_epoch
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    sched1 = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
+    sched2 = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps - warmup_steps, 1))
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[sched1, sched2], milestones=[warmup_steps])
 
 
 # ── metrics ──────────────────────────────────────────────────────────────────
@@ -428,6 +437,13 @@ def train_one_epoch(clip_model, processor, img_proj, txt_proj,
                 image_h, text_h, img_proj.ball)
 
         scaler.scale(loss).backward()
+        # Gradient clipping: prevents exploding gradients, especially in large ViTs
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            list(clip_model.parameters()) +
+            list(img_proj.parameters()) +
+            list(txt_proj.parameters()),
+            max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -508,8 +524,15 @@ def main():
     test_mri = MRIDataset(str(dataset_path), split="test", transform=None)
 
     train_ds = CLIPFinetuneDataset(train_mri)
+
+    # WeightedRandomSampler: compensates for class imbalance across splits
+    labels_list = [train_mri.samples[i][1] for i in range(len(train_mri))]
+    class_counts = np.bincount(labels_list)
+    sample_weights = [1.0 / class_counts[lbl] for lbl in labels_list]
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, sampler=sampler,
         num_workers=num_workers, collate_fn=collate_fn, pin_memory=False,
     )
 
@@ -519,7 +542,8 @@ def main():
     # ── optimizer + scheduler ────────────────────────────────────────────
     optimizer = build_optimizer(clip_model, img_proj, txt_proj, cfg)
     steps_per_epoch = math.ceil(len(train_ds) / batch_size)
-    scheduler = build_scheduler(optimizer, epochs, steps_per_epoch)
+    warmup_epochs_cfg = cfg.get("warmup_epochs", 2)
+    scheduler = build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs_cfg)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     # ── training loop ────────────────────────────────────────────────────

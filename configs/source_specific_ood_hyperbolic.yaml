@@ -1,0 +1,32 @@
+# Source-Specific One-Class OOD (Hyperbolic, MERU-updated)
+# 8-model phase: 4 domains x 2 geometries (this file = Hyperbolic)
+
+dataset_path: "RGIIIT_clean"
+clip_model_name: "openai/clip-vit-base-patch16"
+
+domains:
+  - "Real"
+  - "GAN"
+  - "LDM"
+  - "MLS"
+
+batch_size: 32
+epochs: 25
+num_workers: 0
+
+# RiemannianAdam groups (image encoder + projection)
+lr_image: 1.0e-5
+lr_projection: 1.0e-4
+weight_decay: 1.0e-4
+warmup_epochs: 2
+
+# Hyperbolic geometry
+curvature: 1.0
+scale: 0.1
+projection_dim: 256
+
+threshold_percentile: 95
+threshold_mode: "calibrated_f1"
+
+experiment_dir: "experiments/source_specific_ood_hyperbolic"
+seed: 42
