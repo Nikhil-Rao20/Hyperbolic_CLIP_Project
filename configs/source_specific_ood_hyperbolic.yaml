@@ -12,6 +12,8 @@ domains:
 
 batch_size: 32
 epochs: 25
+# Fixed budget across domains (Task 8): each run executes this many optimizer steps.
+target_total_steps: 700
 num_workers: 0
 
 # RiemannianAdam groups (image encoder + projection)
@@ -28,5 +30,9 @@ projection_dim: 256
 threshold_percentile: 95
 threshold_mode: "calibrated_f1"
 
-experiment_dir: "experiments/source_specific_ood_hyperbolic"
+# Task 5 update: enforce generator-balanced fake composition for val/test.
+# Options: proportional, generator_balanced_strict, generator_balanced_with_replacement
+eval_fake_sampling_policy: "generator_balanced_strict"
+
+experiment_dir: "experiments/source_specific_ood_hyperbolic_reruns"
 seed: 42

@@ -394,13 +394,26 @@ def save_score_distribution(real_scores, fake_scores, default_th, calibrated_th,
     plt.close(fig)
 
 
-def train_one_epoch(clip_model, processor, projection_head, center, dataloader, optimizer, scheduler, scaler, device):
+def train_one_epoch(
+    clip_model,
+    processor,
+    projection_head,
+    center,
+    dataloader,
+    optimizer,
+    scheduler,
+    scaler,
+    device,
+    max_steps: int | None = None,
+):
     clip_model.train()
     projection_head.train()
     center = center.to(device)
     running, n_batches = 0.0, 0
 
     for images, _, _, _ in dataloader:
+        if max_steps is not None and n_batches >= max_steps:
+            break
         inputs = processor(images=images, return_tensors="pt", padding=True)
         inputs = {k: v.to(device) for k, v in inputs.items()}
         optimizer.zero_grad()
@@ -424,7 +437,7 @@ def train_one_epoch(clip_model, processor, projection_head, center, dataloader, 
         running += loss.item()
         n_batches += 1
 
-    return running / max(n_batches, 1)
+    return running / max(n_batches, 1), n_batches
 
 
 def run_domain(cfg, domain: str):
@@ -450,8 +463,16 @@ def run_domain(cfg, domain: str):
     threshold_percentile = float(cfg.get("threshold_percentile", 95))
     threshold_mode = cfg.get("threshold_mode", "calibrated_f1")
     num_workers = int(cfg.get("num_workers", 0))
+    fake_sampling_policy = cfg.get("eval_fake_sampling_policy", "generator_balanced_strict")
+    target_total_steps = int(cfg.get("target_total_steps", 0))
 
-    manifest = load_or_create_manifest(run_dir / "split_manifest.json", dataset_path, domain, seed)
+    manifest = load_or_create_manifest(
+        run_dir / "split_manifest.json",
+        dataset_path,
+        domain,
+        seed,
+        fake_sampling_policy=fake_sampling_policy,
+    )
     train_ids = manifest["train_ids"]
     val_in_domain_ids = manifest["val_in_domain_ids"]
     val_eval_ids = manifest["val_eval_ids"]
@@ -508,19 +529,33 @@ def run_domain(cfg, domain: str):
 
     optimizer = build_optimizer(clip_model, projection_head, cfg)
     steps_per_epoch = math.ceil(len(train_ds) / batch_size)
-    scheduler = build_scheduler(optimizer, epochs, steps_per_epoch, warmup_epochs)
+    if target_total_steps > 0:
+        effective_epochs = max(1, math.ceil(target_total_steps / max(steps_per_epoch, 1)))
+    else:
+        effective_epochs = epochs
+
+    scheduler = build_scheduler(optimizer, effective_epochs, steps_per_epoch, warmup_epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_auroc = -1.0
     log_rows = []
     t0 = time.time()
 
-    for epoch in range(1, epochs + 1):
+    executed_steps = 0
+    for epoch in range(1, effective_epochs + 1):
         epoch_t0 = time.time()
-        tr_loss = train_one_epoch(
+        max_steps_this_epoch = None
+        if target_total_steps > 0:
+            remaining = target_total_steps - executed_steps
+            max_steps_this_epoch = max(0, remaining)
+        tr_loss, steps_ran = train_one_epoch(
             clip_model, processor, projection_head, center,
             train_loader, optimizer, scheduler, scaler, device,
+            max_steps=max_steps_this_epoch,
         )
+        if steps_ran == 0:
+            break
+        executed_steps += steps_ran
 
         val_labels, val_scores, _, _ = compute_anomaly_scores(
             clip_model, processor, projection_head, center,
@@ -574,9 +609,12 @@ def run_domain(cfg, domain: str):
         )
 
         print(
-            f"  Epoch {epoch:>2d}/{epochs} loss={tr_loss:.4f} val_acc={val_metrics['accuracy']:.4f} "
+            f"  Epoch {epoch:>2d}/{effective_epochs} loss={tr_loss:.4f} val_acc={val_metrics['accuracy']:.4f} "
             f"val_auroc={val_metrics['auroc']:.4f} th={active_th:.4f} scale={projection_head.scale.detach().abs().item():.4f}{improved}"
         )
+
+        if target_total_steps > 0 and executed_steps >= target_total_steps:
+            break
 
     elapsed = time.time() - t0
 
@@ -640,7 +678,9 @@ def run_domain(cfg, domain: str):
         "n_real": int((test_labels == 0).sum()),
         "n_fake": int((test_labels == 1).sum()),
         "training_time_sec": round(elapsed, 2),
-        "epochs": epochs,
+        "epochs": epoch,
+        "target_total_steps": target_total_steps,
+        "executed_steps": executed_steps,
         "batch_size": batch_size,
         "projection_dim": projection_dim,
         "curvature": curvature,

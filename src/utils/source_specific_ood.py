@@ -46,6 +46,19 @@ def set_global_determinism(seed: int):
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
 
+    # Prefer deterministic SDP attention kernels when running on CUDA.
+    if torch.cuda.is_available() and hasattr(torch.backends, "cuda"):
+        try:
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                torch.backends.cuda.enable_math_sdp(True)
+        except Exception:
+            # Fallback silently if backend toggles are unavailable in this torch build.
+            pass
+
 
 def worker_init_fn(base_seed: int):
     def _init(worker_id: int):
@@ -148,11 +161,52 @@ def _sample_without_replacement(pool: Sequence[Dict], n: int, rng: np.random.Gen
     return [pool[i] for i in sorted(idxs.tolist())]
 
 
+def _sample_with_optional_replacement(
+    pool: Sequence[Dict],
+    n: int,
+    rng: np.random.Generator,
+    allow_replacement: bool,
+) -> List[Dict]:
+    if n <= 0 or len(pool) == 0:
+        return []
+    if allow_replacement:
+        idxs = rng.choice(len(pool), size=n, replace=True)
+        return [pool[i] for i in idxs.tolist()]
+    return _sample_without_replacement(pool, n, rng)
+
+
+def _allocate_strict_balanced(
+    n_real: int,
+    fake_caps: Dict[str, int],
+    allow_replacement: bool,
+) -> Dict[str, int]:
+    keys = ["GAN", "LDM", "MLS"]
+    n_generators = len(keys)
+
+    if allow_replacement:
+        base = n_real // n_generators
+        rem = n_real % n_generators
+        alloc = {k: base for k in keys}
+        for k in keys[:rem]:
+            alloc[k] += 1
+        return alloc
+
+    feasible_each = min([fake_caps[k] for k in keys] + [n_real // n_generators])
+    return {k: int(feasible_each) for k in keys}
+
+
 def build_balanced_eval_subset(
     split_samples: Sequence[Dict],
     seed: int,
+    fake_sampling_policy: str = "proportional",
 ) -> Tuple[List[Dict], Dict[str, int]]:
-    """Build class-balanced subset with proportional fake-generator composition."""
+    """Build class-balanced subset with configurable fake-generator composition.
+
+    Supported policies:
+    - proportional: original proportional fake allocation.
+    - generator_balanced_strict: equal fake counts per generator, sampled without replacement.
+    - generator_balanced_with_replacement: equal fake counts per generator, sampled with replacement.
+    """
     rng = np.random.default_rng(seed)
 
     real_pool = [s for s in split_samples if s["label"] == 0 and s["source"] in REAL_SOURCES]
@@ -164,15 +218,45 @@ def build_balanced_eval_subset(
 
     n_real = len(real_pool)
     n_fake_total = sum(len(v) for v in fake_pools.values())
-    target = min(n_real, n_fake_total)
-
     fake_caps = {k: len(v) for k, v in fake_pools.items()}
-    fake_alloc = _allocate_proportional(target, fake_caps)
+
+    if fake_sampling_policy == "proportional":
+        target = min(n_real, n_fake_total)
+        fake_alloc = _allocate_proportional(target, fake_caps)
+        allow_replacement = False
+    elif fake_sampling_policy == "generator_balanced_strict":
+        fake_alloc = _allocate_strict_balanced(
+            n_real=n_real,
+            fake_caps=fake_caps,
+            allow_replacement=False,
+        )
+        allow_replacement = False
+        target = sum(fake_alloc.values())
+    elif fake_sampling_policy == "generator_balanced_with_replacement":
+        fake_alloc = _allocate_strict_balanced(
+            n_real=n_real,
+            fake_caps=fake_caps,
+            allow_replacement=True,
+        )
+        allow_replacement = True
+        target = sum(fake_alloc.values())
+    else:
+        raise ValueError(
+            f"Unknown fake_sampling_policy: {fake_sampling_policy}. "
+            "Use one of ['proportional', 'generator_balanced_strict', 'generator_balanced_with_replacement']."
+        )
 
     real_selected = _sample_without_replacement(real_pool, target, rng)
     fake_selected = []
     for k in ["GAN", "LDM", "MLS"]:
-        fake_selected.extend(_sample_without_replacement(fake_pools[k], fake_alloc[k], rng))
+        fake_selected.extend(
+            _sample_with_optional_replacement(
+                fake_pools[k],
+                fake_alloc[k],
+                rng,
+                allow_replacement=allow_replacement,
+            )
+        )
 
     selected = sorted(real_selected + fake_selected, key=lambda s: s["rel_path"])
 
@@ -184,6 +268,8 @@ def build_balanced_eval_subset(
         "target_per_class": target,
         "n_real_pool": n_real,
         "n_fake_pool": n_fake_total,
+        "fake_sampling_policy": fake_sampling_policy,
+        "fake_sampling_with_replacement": allow_replacement,
     }
     return selected, meta
 
@@ -238,7 +324,13 @@ def _manifest_payload(
     }
 
 
-def load_or_create_manifest(manifest_path: Path, dataset_root: Path, domain: str, seed: int) -> Dict:
+def load_or_create_manifest(
+    manifest_path: Path,
+    dataset_root: Path,
+    domain: str,
+    seed: int,
+    fake_sampling_policy: str = "proportional",
+) -> Dict:
     """Load fixed split manifest if present; else create deterministically and save."""
     if manifest_path.exists():
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -255,8 +347,16 @@ def load_or_create_manifest(manifest_path: Path, dataset_root: Path, domain: str
         [s for s in val_samples if is_in_domain(s, domain)], key=lambda s: s["rel_path"]
     )
 
-    val_eval, val_meta = build_balanced_eval_subset(val_samples, seed=seed + 101)
-    test_eval, test_meta = build_balanced_eval_subset(test_samples, seed=seed + 202)
+    val_eval, val_meta = build_balanced_eval_subset(
+        val_samples,
+        seed=seed + 101,
+        fake_sampling_policy=fake_sampling_policy,
+    )
+    test_eval, test_meta = build_balanced_eval_subset(
+        test_samples,
+        seed=seed + 202,
+        fake_sampling_policy=fake_sampling_policy,
+    )
 
     payload = _manifest_payload(
         domain=domain,
