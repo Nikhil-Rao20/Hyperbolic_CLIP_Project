@@ -1,0 +1,33 @@
+dataset_root: RGIIIT_clean
+output_root: experiments_version2
+run_name: one_class_svdd_clip_v1
+
+seed: 42
+n_folds: 5
+
+target_real_train_images: 500
+target_per_generator: 104
+
+clip_model_name: openai/clip-vit-base-patch16
+batch_size: 32
+epochs: 10
+num_workers: 0
+projection_dim: 256
+threshold_percentile: 95
+lr_image: 1.0e-5
+lr_projection: 1.0e-4
+weight_decay: 1.0e-4
+curvature: 1.0
+scale: 0.1
+
+threshold_modes:
+  - youden_j
+  - f1
+
+backbone:
+  model_name: openai/clip-vit-base-patch16
+  vision_encoder_mode: fine_tune
+
+geometries:
+  - euclidean
+  - hyperbolic
