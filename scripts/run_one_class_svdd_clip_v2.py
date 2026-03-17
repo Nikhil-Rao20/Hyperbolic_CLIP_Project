@@ -367,7 +367,8 @@ def save_confusion_matrix(labels, preds, title, out_path):
     ax.set_yticklabels(["Real", "Fake"])
     ax.set_xlabel("Predicted")
     ax.set_ylabel("True")
-    ax.set_title(title)
+    if title:
+        ax.set_title(title)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
