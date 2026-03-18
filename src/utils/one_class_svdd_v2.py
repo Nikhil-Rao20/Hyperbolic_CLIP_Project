@@ -38,19 +38,47 @@ def _parse_from_name(stem: str) -> Tuple[str, str]:
     return "unknown", _strip_slice_suffix(stem)
 
 
+def _path_has(parts_lower: Sequence[str], token: str) -> bool:
+    return any(token in part for part in parts_lower)
+
+
+def _infer_source_from_parts(parts_lower: Sequence[str], generator: str) -> str:
+    if _path_has(parts_lower, "cermep"):
+        return "cermep"
+    if _path_has(parts_lower, "tcga"):
+        return "tcga"
+    if _path_has(parts_lower, "upenn"):
+        return "upenn"
+
+    if generator == "GAN":
+        return "GAN"
+    if generator == "LDM":
+        return "LDM"
+    if generator == "MLS":
+        if _path_has(parts_lower, "mls_cermep"):
+            return "MLS_CERMEP"
+        if _path_has(parts_lower, "mls_tcga"):
+            return "MLS_TCGA"
+        if _path_has(parts_lower, "mls_upenn"):
+            return "MLS_UPenn"
+        return "MLS"
+
+    return "unknown"
+
+
 def _infer_class_and_generator(parts_lower: Sequence[str], stem_lower: str) -> Tuple[str, str]:
-    if "real" in parts_lower:
+    if _path_has(parts_lower, "real") and not _path_has(parts_lower, "fake"):
         return "Real", "Real"
 
-    if "gan" in parts_lower or stem_lower.startswith("gan__"):
+    if _path_has(parts_lower, "gan") or stem_lower.startswith("gan__"):
         return "Fake", "GAN"
-    if "ldm" in parts_lower or stem_lower.startswith("ldm__"):
+    if _path_has(parts_lower, "ldm") or stem_lower.startswith("ldm__"):
         return "Fake", "LDM"
 
-    if "mls" in parts_lower or stem_lower.startswith("mls_") or stem_lower.startswith("mls__"):
+    if _path_has(parts_lower, "mls") or stem_lower.startswith("mls_") or stem_lower.startswith("mls__"):
         return "Fake", "MLS"
 
-    if "fake" in parts_lower:
+    if _path_has(parts_lower, "fake"):
         if stem_lower.startswith("gan"):
             return "Fake", "GAN"
         if stem_lower.startswith("ldm"):
@@ -78,6 +106,8 @@ def collect_samples(dataset_root: Path) -> List[Sample]:
             continue
 
         source, subject_tail = _parse_from_name(stem)
+        if source == "unknown":
+            source = _infer_source_from_parts(parts, generator)
 
         if class_name == "Real":
             subject_id = f"Real::{source}::{subject_tail}"

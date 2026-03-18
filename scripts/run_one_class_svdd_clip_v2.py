@@ -59,9 +59,20 @@ def _to_tensor(output):
 
 def _rel_path_to_label_source(rel_path: str) -> Tuple[int, str]:
     path = Path(rel_path)
-    label = 0 if "Real" in path.parts else 1
+    parts_lower = [p.lower() for p in path.parts]
+    is_real = any("real" in p for p in parts_lower) and not any("fake" in p for p in parts_lower)
+    label = 0 if is_real else 1
+
     stem = path.stem
-    source = stem.split("__", 1)[0] if "__" in stem else "unknown"
+    if "__" in stem:
+        source = stem.split("__", 1)[0]
+    else:
+        source = "unknown"
+        for key in ["cermep", "tcga", "upenn", "gan", "ldm", "mls_cermep", "mls_tcga", "mls_upenn", "mls"]:
+            if any(key in p for p in parts_lower):
+                source = key.upper() if key in {"gan", "ldm"} else key
+                break
+
     return label, source
 
 
