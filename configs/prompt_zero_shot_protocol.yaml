@@ -1,0 +1,34 @@
+dataset_root: RGIIIT_clean
+manifest_path: experiments_version2/one_class_svdd_clip_v1_kaggle/experiments_version2/protocol_manifest.json
+
+output_root: experiments_zero_shot_protocol
+run_name: prompt_zero_shot_cleaned_protocol
+
+batch_size: 16
+
+# CLIP class templates (pure zero-shot)
+real_prompts:
+  - A Real MRI image
+fake_prompts:
+  - A Fake MRI image
+
+# Used for InstructBLIP text+image generation mode
+instruct_prompt: "Classify this brain MRI image as Real or Fake. Answer with one word: Real or Fake."
+instructblip_max_new_tokens: 6
+
+models:
+  - name: clip_vit_b32
+    type: clip
+    model_id: openai/clip-vit-base-patch32
+
+  - name: clip_vit_b16
+    type: clip
+    model_id: openai/clip-vit-base-patch16
+
+  - name: clip_rn101
+    type: clip
+    model_id: openai/clip-rn101
+
+  - name: instructblip
+    type: instructblip
+    model_id: Salesforce/instructblip-flan-t5-base
