@@ -27,7 +27,7 @@ models:
 
   - name: clip_rn101
     type: clip
-    model_id: openai/clip-rn101
+    model_id: laion/CLIP-RN101-quickgelu
 
   - name: instructblip
     type: instructblip

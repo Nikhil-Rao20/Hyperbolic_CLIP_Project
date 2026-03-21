@@ -305,6 +305,7 @@ def main() -> int:
     )
 
     summary_rows: List[Dict] = []
+    failed_models: List[Dict] = []
 
     for model_cfg in cfg.get("models", []):
         model_name = model_cfg["name"]
@@ -315,86 +316,110 @@ def main() -> int:
         model_dir = run_dir / model_name
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        zs_model = PromptZeroShotModel(
-            model_id=model_id,
-            model_type=model_type,
-            device=device,
-            prompt_question=instruct_prompt,
-        )
-
-        if model_type == "clip":
-            real_emb, fake_emb = zs_model.build_class_text_embeddings(real_prompts, fake_prompts)
-        else:
-            real_emb = None
-            fake_emb = None
-
-        tests_payload = {}
-        for test_name, test_spec in manifest["test_sets"].items():
-            test_dir = model_dir / test_name
-            test_dir.mkdir(parents=True, exist_ok=True)
-
-            rel_paths = sorted(test_spec["real_ids"] + test_spec["fake_ids"])
-            ds = ImagePathDataset(dataset_root, rel_paths)
+        try:
+            zs_model = PromptZeroShotModel(
+                model_id=model_id,
+                model_type=model_type,
+                device=device,
+                prompt_question=instruct_prompt,
+            )
 
             if model_type == "clip":
-                labels, probs, _ = infer_clip_probs(
-                    zs_model=zs_model,
-                    dataset=ds,
-                    batch_size=batch_size,
-                    real_emb=real_emb,
-                    fake_emb=fake_emb,
-                )
+                real_emb, fake_emb = zs_model.build_class_text_embeddings(real_prompts, fake_prompts)
             else:
-                labels, probs, _ = infer_instructblip_probs(
-                    zs_model=zs_model,
-                    dataset=ds,
-                    batch_size=batch_size,
-                    max_new_tokens=max_new_tokens,
-                )
+                real_emb = None
+                fake_emb = None
 
-            metrics = compute_metrics(labels, probs)
-            _save_confusion_matrix(labels, probs, test_dir / "confusion_matrix.png")
+            tests_payload = {}
+            for test_name, test_spec in manifest["test_sets"].items():
+                test_dir = model_dir / test_name
+                test_dir.mkdir(parents=True, exist_ok=True)
 
-            payload = {
-                "model_name": model_name,
-                "model_type": model_type,
-                "test_set": test_name,
-                "n_real": int(test_spec["n_real"]),
-                "n_fake": int(test_spec["n_fake"]),
-                "real_prompts": real_prompts if model_type == "clip" else None,
-                "fake_prompts": fake_prompts if model_type == "clip" else None,
-                "instruct_prompt": instruct_prompt if model_type == "instructblip" else None,
-                "metrics": metrics,
-                "decision_threshold": 0.5,
-            }
-            with (test_dir / "results.json").open("w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+                rel_paths = sorted(test_spec["real_ids"] + test_spec["fake_ids"])
+                ds = ImagePathDataset(dataset_root, rel_paths)
 
-            tests_payload[test_name] = payload
+                if model_type == "clip":
+                    labels, probs, _ = infer_clip_probs(
+                        zs_model=zs_model,
+                        dataset=ds,
+                        batch_size=batch_size,
+                        real_emb=real_emb,
+                        fake_emb=fake_emb,
+                    )
+                else:
+                    labels, probs, _ = infer_instructblip_probs(
+                        zs_model=zs_model,
+                        dataset=ds,
+                        batch_size=batch_size,
+                        max_new_tokens=max_new_tokens,
+                    )
 
-            summary_rows.append(
-                {
+                metrics = compute_metrics(labels, probs)
+                _save_confusion_matrix(labels, probs, test_dir / "confusion_matrix.png")
+
+                payload = {
                     "model_name": model_name,
+                    "model_type": model_type,
                     "test_set": test_name,
                     "n_real": int(test_spec["n_real"]),
                     "n_fake": int(test_spec["n_fake"]),
-                    "auroc": round(metrics["auroc"], 6),
-                    "auprc": round(metrics["auprc"], 6),
-                    "accuracy": round(metrics["accuracy"], 6),
-                    "f1": round(metrics["f1"], 6),
-                    "precision": round(metrics["precision"], 6),
-                    "sensitivity": round(metrics["sensitivity"], 6),
-                    "specificity": round(metrics["specificity"], 6),
-                    "balanced_mean_accuracy": round(metrics["balanced_mean_accuracy"], 6),
+                    "real_prompts": real_prompts if model_type == "clip" else None,
+                    "fake_prompts": fake_prompts if model_type == "clip" else None,
+                    "instruct_prompt": instruct_prompt if model_type == "instructblip" else None,
+                    "metrics": metrics,
+                    "decision_threshold": 0.5,
+                }
+                with (test_dir / "results.json").open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+
+                tests_payload[test_name] = payload
+
+                summary_rows.append(
+                    {
+                        "model_name": model_name,
+                        "test_set": test_name,
+                        "n_real": int(test_spec["n_real"]),
+                        "n_fake": int(test_spec["n_fake"]),
+                        "auroc": round(metrics["auroc"], 6),
+                        "auprc": round(metrics["auprc"], 6),
+                        "accuracy": round(metrics["accuracy"], 6),
+                        "f1": round(metrics["f1"], 6),
+                        "precision": round(metrics["precision"], 6),
+                        "sensitivity": round(metrics["sensitivity"], 6),
+                        "specificity": round(metrics["specificity"], 6),
+                        "balanced_mean_accuracy": round(metrics["balanced_mean_accuracy"], 6),
+                    }
+                )
+
+            with (model_dir / "model_summary.json").open("w", encoding="utf-8") as f:
+                json.dump({"model_name": model_name, "tests": tests_payload}, f, indent=2)
+
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[WARN] Skipping model {model_name}: {err_msg}", flush=True)
+            failed_models.append(
+                {
+                    "model_name": model_name,
+                    "model_id": model_id,
+                    "model_type": model_type,
+                    "error": err_msg,
                 }
             )
-
-        with (model_dir / "model_summary.json").open("w", encoding="utf-8") as f:
-            json.dump({"model_name": model_name, "tests": tests_payload}, f, indent=2)
+            with (model_dir / "model_error.json").open("w", encoding="utf-8") as f:
+                json.dump(failed_models[-1], f, indent=2)
 
     write_summary_csv(summary_rows, run_dir / "final_prompt_zero_shot_summary.csv")
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
-        json.dump({"run_dir": run_dir.as_posix(), "n_rows": len(summary_rows)}, f, indent=2)
+        json.dump(
+            {
+                "run_dir": run_dir.as_posix(),
+                "n_rows": len(summary_rows),
+                "n_models_failed": len(failed_models),
+                "failed_models": failed_models,
+            },
+            f,
+            indent=2,
+        )
 
     print("\\n[INFO] Completed pure prompt-based zero-shot evaluation.")
     print("[INFO] Summary:", run_dir / "final_prompt_zero_shot_summary.csv")
