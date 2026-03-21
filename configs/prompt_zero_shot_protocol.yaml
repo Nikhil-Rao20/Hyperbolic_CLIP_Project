@@ -4,7 +4,7 @@ manifest_path: configs/manifests/cleaned_protocol_manifest.json
 output_root: experiments_zero_shot_protocol
 run_name: prompt_zero_shot_cleaned_protocol
 
-batch_size: 16
+batch_size: 32
 
 # CLIP class templates (pure zero-shot)
 real_prompts:
