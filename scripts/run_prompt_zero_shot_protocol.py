@@ -33,6 +33,11 @@ from transformers import (
     InstructBlipProcessor,
 )
 
+try:
+    import open_clip
+except ImportError:
+    open_clip = None
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -84,7 +89,14 @@ class ImagePathDataset(Dataset):
 
 
 class PromptZeroShotModel:
-    def __init__(self, model_id: str, model_type: str, device: torch.device, prompt_question: str):
+    def __init__(
+        self,
+        model_id: str,
+        model_type: str,
+        device: torch.device,
+        prompt_question: str,
+        open_clip_pretrained: str | None = None,
+    ):
         self.model_id = model_id
         self.model_type = model_type
         self.device = device
@@ -93,6 +105,18 @@ class PromptZeroShotModel:
         if self.model_type == "clip":
             self.model = CLIPModel.from_pretrained(model_id, use_safetensors=True).to(device)
             self.processor = CLIPProcessor.from_pretrained(model_id)
+        elif self.model_type == "open_clip":
+            if open_clip is None:
+                raise ImportError(
+                    "open_clip_torch is required for model_type='open_clip'. Install with: pip install open_clip_torch"
+                )
+            pretrained_tag = open_clip_pretrained or "openai"
+            self.model, _, self.open_clip_preprocess = open_clip.create_model_and_transforms(
+                model_name=model_id,
+                pretrained=pretrained_tag,
+            )
+            self.model = self.model.to(device)
+            self.open_clip_tokenizer = open_clip.get_tokenizer(model_id)
         elif self.model_type == "instructblip":
             self.model = InstructBlipForConditionalGeneration.from_pretrained(model_id).to(device)
             self.processor = InstructBlipProcessor.from_pretrained(model_id)
@@ -105,8 +129,18 @@ class PromptZeroShotModel:
 
     @torch.no_grad()
     def build_class_text_embeddings(self, real_prompts: List[str], fake_prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.model_type != "clip":
-            raise RuntimeError("Class text embeddings are only for CLIP models")
+        if self.model_type not in {"clip", "open_clip"}:
+            raise RuntimeError("Class text embeddings are only for CLIP/open_clip models")
+
+        if self.model_type == "open_clip":
+            real_tokens = self.open_clip_tokenizer(real_prompts).to(self.device)
+            fake_tokens = self.open_clip_tokenizer(fake_prompts).to(self.device)
+
+            real_feats = self.model.encode_text(real_tokens)
+            fake_feats = self.model.encode_text(fake_tokens)
+            real_mean = F.normalize(real_feats.float().mean(dim=0), dim=-1)
+            fake_mean = F.normalize(fake_feats.float().mean(dim=0), dim=-1)
+            return real_mean, fake_mean
 
         real_inputs = self.processor(text=real_prompts, return_tensors="pt", padding=True)
         fake_inputs = self.processor(text=fake_prompts, return_tensors="pt", padding=True)
@@ -118,6 +152,22 @@ class PromptZeroShotModel:
         real_mean = F.normalize(real_feats.mean(dim=0), dim=-1)
         fake_mean = F.normalize(fake_feats.mean(dim=0), dim=-1)
         return real_mean, fake_mean
+
+    @torch.no_grad()
+    def encode_image_batch(self, images: List[Image.Image]) -> torch.Tensor:
+        if self.model_type == "clip":
+            inputs = self.processor(images=images, return_tensors="pt", padding=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            image_features = _to_tensor(self.model.get_image_features(**inputs))
+            return F.normalize(image_features.float(), dim=-1)
+
+        if self.model_type == "open_clip":
+            img_tensors = [self.open_clip_preprocess(img) for img in images]
+            pixel_values = torch.stack(img_tensors, dim=0).to(self.device)
+            image_features = self.model.encode_image(pixel_values)
+            return F.normalize(image_features.float(), dim=-1)
+
+        raise RuntimeError("encode_image_batch is only valid for CLIP/open_clip models")
 
 
 @torch.no_grad()
@@ -141,11 +191,7 @@ def infer_clip_probs(
         lbs = [x[1] for x in batch]
         srcs = [x[2] for x in batch]
 
-        inputs = zs_model.processor(images=images, return_tensors="pt", padding=True)
-        inputs = {k: v.to(zs_model.device) for k, v in inputs.items()}
-
-        image_features = _to_tensor(zs_model.model.get_image_features(**inputs))
-        image_features = F.normalize(image_features.float(), dim=-1)
+        image_features = zs_model.encode_image_batch(images)
 
         logits = image_features @ class_embs.T
         probs_fake = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
@@ -311,6 +357,7 @@ def main() -> int:
         model_name = model_cfg["name"]
         model_id = model_cfg["model_id"]
         model_type = model_cfg.get("type", "clip")
+        open_clip_pretrained = model_cfg.get("open_clip_pretrained")
 
         print(f"\\n[MODEL] {model_name} ({model_id})", flush=True)
         model_dir = run_dir / model_name
@@ -322,9 +369,10 @@ def main() -> int:
                 model_type=model_type,
                 device=device,
                 prompt_question=instruct_prompt,
+                open_clip_pretrained=open_clip_pretrained,
             )
 
-            if model_type == "clip":
+            if model_type in {"clip", "open_clip"}:
                 real_emb, fake_emb = zs_model.build_class_text_embeddings(real_prompts, fake_prompts)
             else:
                 real_emb = None
@@ -338,7 +386,7 @@ def main() -> int:
                 rel_paths = sorted(test_spec["real_ids"] + test_spec["fake_ids"])
                 ds = ImagePathDataset(dataset_root, rel_paths)
 
-                if model_type == "clip":
+                if model_type in {"clip", "open_clip"}:
                     labels, probs, _ = infer_clip_probs(
                         zs_model=zs_model,
                         dataset=ds,
@@ -363,8 +411,8 @@ def main() -> int:
                     "test_set": test_name,
                     "n_real": int(test_spec["n_real"]),
                     "n_fake": int(test_spec["n_fake"]),
-                    "real_prompts": real_prompts if model_type == "clip" else None,
-                    "fake_prompts": fake_prompts if model_type == "clip" else None,
+                    "real_prompts": real_prompts if model_type in {"clip", "open_clip"} else None,
+                    "fake_prompts": fake_prompts if model_type in {"clip", "open_clip"} else None,
                     "instruct_prompt": instruct_prompt if model_type == "instructblip" else None,
                     "metrics": metrics,
                     "decision_threshold": 0.5,
