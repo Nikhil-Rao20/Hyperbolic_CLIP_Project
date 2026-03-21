@@ -1,5 +1,5 @@
 dataset_root: RGIIIT_clean
-manifest_path: experiments_version2/one_class_svdd_clip_v1_kaggle/experiments_version2/protocol_manifest.json
+manifest_path: configs/manifests/cleaned_protocol_manifest.json
 
 output_root: experiments_frozen_protocol
 run_name: frozen_pretrained_cleaned_protocol
