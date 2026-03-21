@@ -79,6 +79,10 @@ dataset_audit/reports/dataset_structure_report.json
 experiments/
 experiments_version2/
 experiments_version2_raw/
+experiments_zero_shot_protocol/
+
+# ─── Local packaged sub-repo (excluded from parent repo) ───
+Fake_MRI_Det/
 
 # ─── Notebooks (run on Kaggle, not committed) ───
 notebooks/*.ipynb
