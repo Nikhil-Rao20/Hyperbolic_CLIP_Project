@@ -114,6 +114,7 @@ class PromptZeroShotModel:
             self.model, _, self.open_clip_preprocess = open_clip.create_model_and_transforms(
                 model_name=model_id,
                 pretrained=pretrained_tag,
+                quick_gelu=True,
             )
             self.model = self.model.to(device)
             self.open_clip_tokenizer = open_clip.get_tokenizer(model_id)
