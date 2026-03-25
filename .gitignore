@@ -86,6 +86,7 @@ Fake_MRI_Det/
 
 # ─── Notebooks (run on Kaggle, not committed) ───
 notebooks/*.ipynb
+notebooks/
 
 # ─── Internal documentation (personal reference only) ───
 docs/internal/
