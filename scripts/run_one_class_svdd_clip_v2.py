@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -44,6 +45,91 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.one_class_svdd_v2 import build_protocol_manifest, save_manifest
 from src.utils.source_specific_ood import build_loader_generator, set_global_determinism, worker_init_fn
+
+
+def _normalize_backbone_key(name: str) -> str:
+    return str(name).strip().upper().replace("-", "").replace("_", "")
+
+
+def _resolve_backbone_registry(cfg: dict) -> Tuple[Dict[str, Dict], str]:
+    registry_cfg = cfg.get("backbone_registry", {}) or {}
+    resolved: Dict[str, Dict] = {}
+
+    for key, spec in registry_cfg.items():
+        norm_key = _normalize_backbone_key(key)
+        if not isinstance(spec, dict):
+            continue
+        model_name = spec.get("model_name")
+        if not model_name:
+            continue
+        resolved[norm_key] = {
+            "display_name": spec.get("display_name", norm_key),
+            "model_name": model_name,
+            "vision_encoder_mode": spec.get(
+                "vision_encoder_mode",
+                cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune"),
+            ),
+        }
+
+    if not resolved:
+        fallback_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
+        resolved["B16"] = {
+            "display_name": "Hyperbolic CLIP ViT B16",
+            "model_name": fallback_model_name,
+            "vision_encoder_mode": cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune"),
+        }
+
+    default_key = _normalize_backbone_key(cfg.get("default_backbone", "B16"))
+    if default_key not in resolved:
+        default_key = "B16" if "B16" in resolved else sorted(resolved.keys())[0]
+
+    return resolved, default_key
+
+
+def _parse_requested_backbones(backbones_arg: Sequence[str] | None) -> List[str]:
+    if not backbones_arg:
+        return []
+    requested: List[str] = []
+    seen = set()
+    for token in backbones_arg:
+        for part in str(token).split(","):
+            norm = _normalize_backbone_key(part)
+            if not norm or norm in seen:
+                continue
+            requested.append(norm)
+            seen.add(norm)
+    return requested
+
+
+def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
+    cfg = copy.deepcopy(base_cfg)
+    cfg["clip_model_name"] = backbone_spec["model_name"]
+    backbone_cfg = dict(cfg.get("backbone", {}))
+    backbone_cfg["model_name"] = backbone_spec["model_name"]
+    backbone_cfg["vision_encoder_mode"] = backbone_spec.get("vision_encoder_mode", backbone_cfg.get("vision_encoder_mode", "fine_tune"))
+    cfg["backbone"] = backbone_cfg
+    return cfg
+
+
+def _resolve_optional_protocol_manifest(path_str: str | None) -> Path | None:
+    if not path_str:
+        return None
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
+
+
+def _load_protocol_manifest(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    required_keys = {"test_sets", "cv_folds", "real_train"}
+    missing = sorted(required_keys - set(manifest.keys()))
+    if missing:
+        raise RuntimeError(f"Protocol manifest missing required keys: {missing}")
+
+    return manifest
 
 
 def _load_config(path: Path) -> dict:
@@ -940,6 +1026,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="One-Class SVDD CLIP v2 orchestrator")
     parser.add_argument("--config", type=str, default="configs/one_class_svdd_clip_v2.yaml")
     parser.add_argument("--build-only", action="store_true", help="Only build protocol manifests, skip training/eval")
+    parser.add_argument(
+        "--backbones",
+        nargs="*",
+        default=None,
+        help=(
+            "Backbone keys to run sequentially (space/comma separated). "
+            "Example: --backbones B32 L16 RN101 or --backbones B32,RN101. "
+            "If omitted, the config default backbone is used."
+        ),
+    )
+    parser.add_argument(
+        "--protocol-manifest",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to an existing protocol manifest JSON to reuse exact splits/folds. "
+            "Overrides protocol_manifest_path in config when provided."
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -947,6 +1052,15 @@ def main() -> int:
         cfg_path = PROJECT_ROOT / cfg_path
 
     cfg = _load_config(cfg_path)
+    backbone_registry, default_backbone_key = _resolve_backbone_registry(cfg)
+
+    requested_backbones = _parse_requested_backbones(args.backbones)
+    selected_backbones = requested_backbones or [default_backbone_key]
+    unknown_backbones = [b for b in selected_backbones if b not in backbone_registry]
+    if unknown_backbones:
+        print("[ERROR] Unknown backbone key(s):", ", ".join(unknown_backbones), flush=True)
+        print("[ERROR] Available backbone key(s):", ", ".join(sorted(backbone_registry.keys())), flush=True)
+        return 2
 
     dataset_root = Path(cfg["dataset_root"])
     if not dataset_root.is_absolute():
@@ -965,13 +1079,36 @@ def main() -> int:
     run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = build_protocol_manifest(
-        dataset_root=dataset_root,
-        seed=seed,
-        target_real_train_images=target_real_train,
-        target_per_generator=target_per_generator,
-        n_folds=n_folds,
-    )
+    with (run_dir / "backbone_selection.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "default_backbone": default_backbone_key,
+                "requested_backbones": requested_backbones,
+                "selected_backbones": selected_backbones,
+                "available_backbones": backbone_registry,
+            },
+            f,
+            indent=2,
+        )
+
+    manifest_path_cli = _resolve_optional_protocol_manifest(args.protocol_manifest)
+    manifest_path_cfg = _resolve_optional_protocol_manifest(cfg.get("protocol_manifest_path"))
+    selected_manifest_path = manifest_path_cli or manifest_path_cfg
+
+    if selected_manifest_path is not None:
+        if not selected_manifest_path.exists():
+            raise FileNotFoundError(f"Protocol manifest not found: {selected_manifest_path}")
+        manifest = _load_protocol_manifest(selected_manifest_path)
+        print("[INFO] Reusing protocol manifest:", selected_manifest_path, flush=True)
+    else:
+        manifest = build_protocol_manifest(
+            dataset_root=dataset_root,
+            seed=seed,
+            target_real_train_images=target_real_train,
+            target_per_generator=target_per_generator,
+            n_folds=n_folds,
+        )
+        print("[INFO] Generated protocol manifest from dataset and config.", flush=True)
 
     protocol_manifest_path = run_dir / "protocol_manifest.json"
     save_manifest(manifest, protocol_manifest_path)
@@ -991,23 +1128,137 @@ def main() -> int:
         return 0
 
     geometries = cfg.get("geometries", ["euclidean", "hyperbolic"])
-    all_summary_rows = []
-    geometry_summaries = []
+    multi_backbone_rows = []
+    multi_backbone_runs = []
 
-    for geometry in geometries:
-        geometry_dir = run_dir / geometry
-        geometry_dir.mkdir(parents=True, exist_ok=True)
-        t0 = time.time()
-        summary = run_geometry(cfg, manifest, dataset_root, geometry, geometry_dir)
-        summary["elapsed_sec"] = round(time.time() - t0, 2)
-        geometry_summaries.append(summary)
-        all_summary_rows.extend(summary["summary_rows"])
+    for backbone_key in selected_backbones:
+        backbone_spec = backbone_registry[backbone_key]
+        cfg_for_backbone = _apply_backbone_to_cfg(cfg, backbone_spec)
 
-    write_summary_csv(all_summary_rows, run_dir / "final_8run_summary.csv")
-    with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
-        json.dump({"geometries": geometry_summaries}, f, indent=2)
+        if len(selected_backbones) == 1 and not requested_backbones:
+            backbone_run_dir = run_dir
+        else:
+            backbone_run_dir = run_dir / f"backbone_{backbone_key}"
+            backbone_run_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[INFO] Final 8-run summary saved to", run_dir / "final_8run_summary.csv", flush=True)
+        print(
+            f"[INFO] Running backbone={backbone_key} model={backbone_spec['model_name']} in {backbone_run_dir}",
+            flush=True,
+        )
+
+        all_summary_rows = []
+        geometry_summaries = []
+        for geometry in geometries:
+            geometry_dir = backbone_run_dir / geometry
+            geometry_dir.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            summary = run_geometry(cfg_for_backbone, manifest, dataset_root, geometry, geometry_dir)
+            summary["elapsed_sec"] = round(time.time() - t0, 2)
+            summary["backbone_key"] = backbone_key
+            summary["clip_model_name"] = backbone_spec["model_name"]
+            geometry_summaries.append(summary)
+
+            for row in summary["summary_rows"]:
+                row_with_backbone = dict(row)
+                row_with_backbone["backbone_key"] = backbone_key
+                row_with_backbone["clip_model_name"] = backbone_spec["model_name"]
+                all_summary_rows.append(row_with_backbone)
+                multi_backbone_rows.append(row_with_backbone)
+
+        write_summary_csv(
+            [
+                {
+                    k: v
+                    for k, v in row.items()
+                    if k
+                    in {
+                        "geometry",
+                        "test_set",
+                        "n_real",
+                        "n_fake",
+                        "auroc",
+                        "auprc",
+                        "accuracy_default",
+                        "f1_default",
+                        "sensitivity_default",
+                        "specificity_default",
+                        "accuracy_f1",
+                        "f1_f1",
+                        "sensitivity_f1",
+                        "specificity_f1",
+                        "accuracy_youden_j",
+                        "f1_youden_j",
+                        "sensitivity_youden_j",
+                        "specificity_youden_j",
+                    }
+                }
+                for row in all_summary_rows
+            ],
+            backbone_run_dir / "final_8run_summary.csv",
+        )
+        with (backbone_run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "backbone_key": backbone_key,
+                    "clip_model_name": backbone_spec["model_name"],
+                    "geometries": geometry_summaries,
+                },
+                f,
+                indent=2,
+            )
+
+        multi_backbone_runs.append(
+            {
+                "backbone_key": backbone_key,
+                "clip_model_name": backbone_spec["model_name"],
+                "run_dir": backbone_run_dir.as_posix(),
+            }
+        )
+
+    with (run_dir / "run_summary_multi_backbone.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "runs": multi_backbone_runs,
+                "selected_backbones": selected_backbones,
+            },
+            f,
+            indent=2,
+        )
+
+    if len(selected_backbones) > 1:
+        fieldnames = [
+            "backbone_key",
+            "clip_model_name",
+            "geometry",
+            "test_set",
+            "n_real",
+            "n_fake",
+            "auroc",
+            "auprc",
+            "accuracy_default",
+            "f1_default",
+            "sensitivity_default",
+            "specificity_default",
+            "accuracy_f1",
+            "f1_f1",
+            "sensitivity_f1",
+            "specificity_f1",
+            "accuracy_youden_j",
+            "f1_youden_j",
+            "sensitivity_youden_j",
+            "specificity_youden_j",
+        ]
+        with (run_dir / "final_multi_backbone_summary.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(
+                [
+                    {key: row.get(key) for key in fieldnames}
+                    for row in multi_backbone_rows
+                ]
+            )
+
+    print("[INFO] Backbone run(s) completed under", run_dir, flush=True)
     return 0
 
 
