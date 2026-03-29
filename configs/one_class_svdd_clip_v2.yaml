@@ -22,7 +22,9 @@ backbone_registry:
     vision_encoder_mode: fine_tune
   RN101:
     display_name: Hyperbolic CLIP ViT RN101
-    model_name: openai/clip-rn101
+    type: open_clip
+    model_name: RN101
+    open_clip_pretrained: openai
     vision_encoder_mode: fine_tune
 batch_size: 32
 epochs: 10

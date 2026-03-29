@@ -38,6 +38,10 @@ from torch.utils.data import DataLoader, Dataset
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 
 from transformers import CLIPModel, CLIPProcessor
+try:
+    import open_clip
+except ImportError:
+    open_clip = None
 import geoopt
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +69,8 @@ def _resolve_backbone_registry(cfg: dict) -> Tuple[Dict[str, Dict], str]:
         resolved[norm_key] = {
             "display_name": spec.get("display_name", norm_key),
             "model_name": model_name,
+            "type": spec.get("type", "clip"),
+            "open_clip_pretrained": spec.get("open_clip_pretrained", "openai"),
             "vision_encoder_mode": spec.get(
                 "vision_encoder_mode",
                 cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune"),
@@ -76,6 +82,8 @@ def _resolve_backbone_registry(cfg: dict) -> Tuple[Dict[str, Dict], str]:
         resolved["B16"] = {
             "display_name": "Hyperbolic CLIP ViT B16",
             "model_name": fallback_model_name,
+            "type": "clip",
+            "open_clip_pretrained": "openai",
             "vision_encoder_mode": cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune"),
         }
 
@@ -106,6 +114,8 @@ def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
     cfg["clip_model_name"] = backbone_spec["model_name"]
     backbone_cfg = dict(cfg.get("backbone", {}))
     backbone_cfg["model_name"] = backbone_spec["model_name"]
+    backbone_cfg["type"] = backbone_spec.get("type", "clip")
+    backbone_cfg["open_clip_pretrained"] = backbone_spec.get("open_clip_pretrained", "openai")
     backbone_cfg["vision_encoder_mode"] = backbone_spec.get("vision_encoder_mode", backbone_cfg.get("vision_encoder_mode", "fine_tune"))
     cfg["backbone"] = backbone_cfg
     return cfg
@@ -143,8 +153,43 @@ def _to_tensor(output):
     return output.pooler_output if hasattr(output, "pooler_output") else output[0]
 
 
-def _get_clip_image_feature_dim(clip_model: CLIPModel) -> int:
-    # CLIP backbones can expose different image feature dimensions (e.g., B32=512, L14=768).
+def _load_image_backbone(backbone_name: str, backbone_type: str, open_clip_pretrained: str, device: torch.device):
+    if backbone_type == "open_clip":
+        if open_clip is None:
+            raise ImportError("open_clip_torch is required for open_clip backbones. Install with: pip install open_clip_torch")
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            model_name=backbone_name,
+            pretrained=open_clip_pretrained,
+            quick_gelu=True,
+        )
+        return model.to(device), preprocess
+
+    model = CLIPModel.from_pretrained(backbone_name, use_safetensors=True).to(device)
+    processor = CLIPProcessor.from_pretrained(backbone_name)
+    return model, processor
+
+
+def _encode_image_features(clip_model, processor, images, device: torch.device, backbone_type: str) -> torch.Tensor:
+    if backbone_type == "open_clip":
+        pixel_values = torch.stack([processor(img) for img in images], dim=0).to(device)
+        return clip_model.encode_image(pixel_values)
+
+    inputs = processor(images=images, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    return _to_tensor(clip_model.get_image_features(**inputs))
+
+
+def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
+    # CLIP backbones can expose different image feature dimensions (e.g., B32=512, L14=768, RN101=512).
+    if backbone_type == "open_clip":
+        dim = getattr(getattr(clip_model, "visual", None), "output_dim", None)
+        if isinstance(dim, int) and dim > 0:
+            return dim
+        dim = getattr(clip_model, "embed_dim", None)
+        if isinstance(dim, int) and dim > 0:
+            return dim
+        return 512
+
     dim = getattr(getattr(clip_model, "config", None), "projection_dim", None)
     if isinstance(dim, int) and dim > 0:
         return dim
@@ -237,16 +282,14 @@ class HyperbolicProjectionHead(nn.Module):
 
 
 @torch.no_grad()
-def compute_center_euclidean(clip_model, processor, projection_head, dataset, batch_size, device):
+def compute_center_euclidean(clip_model, processor, projection_head, dataset, batch_size, device, backbone_type: str):
     clip_model.eval()
     projection_head.eval()
     embs = []
     for start in range(0, len(dataset), batch_size):
         end = min(start + batch_size, len(dataset))
         imgs = [dataset[i][0] for i in range(start, end)]
-        inputs = processor(images=imgs, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        feats = _to_tensor(clip_model.get_image_features(**inputs))
+        feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
         proj = projection_head(feats)
         embs.append(proj.cpu())
     return torch.cat(embs, dim=0).mean(dim=0)
@@ -275,16 +318,14 @@ def frechet_mean_iterative(points, curvature, max_iter=100, tol=1e-7):
 
 
 @torch.no_grad()
-def compute_center_hyperbolic(clip_model, processor, projection_head, dataset, batch_size, device):
+def compute_center_hyperbolic(clip_model, processor, projection_head, dataset, batch_size, device, backbone_type: str):
     clip_model.eval()
     projection_head.eval()
     embs = []
     for start in range(0, len(dataset), batch_size):
         end = min(start + batch_size, len(dataset))
         imgs = [dataset[i][0] for i in range(start, end)]
-        inputs = processor(images=imgs, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        feats = _to_tensor(clip_model.get_image_features(**inputs))
+        feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
         proj = projection_head(feats)
         embs.append(proj.cpu())
     all_embs = torch.cat(embs, dim=0)
@@ -305,7 +346,7 @@ def svdd_loss_hyperbolic(embeddings, center, ball):
 
 
 @torch.no_grad()
-def compute_anomaly_scores(clip_model, processor, projection_head, center, dataset, batch_size, device, geometry: str):
+def compute_anomaly_scores(clip_model, processor, projection_head, center, dataset, batch_size, device, geometry: str, backbone_type: str):
     clip_model.eval()
     projection_head.eval()
     center = center.to(device)
@@ -321,9 +362,7 @@ def compute_anomaly_scores(clip_model, processor, projection_head, center, datas
             srcs.append(src)
             rels.append(rel)
 
-        inputs = processor(images=imgs, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        feats = _to_tensor(clip_model.get_image_features(**inputs))
+        feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
         proj = projection_head(feats)
 
         if geometry == "euclidean":
@@ -485,13 +524,21 @@ def save_confusion_matrix(labels, preds, title, out_path):
     plt.close(fig)
 
 
-def configure_clip_trainability(clip_model, vision_mode: str):
+def configure_clip_trainability(clip_model, vision_mode: str, backbone_type: str):
+    train_vision = vision_mode != "frozen"
+
+    if backbone_type == "open_clip":
+        for p in clip_model.parameters():
+            p.requires_grad = False
+        if hasattr(clip_model, "visual"):
+            for p in clip_model.visual.parameters():
+                p.requires_grad = train_vision
+        return
+
     for p in clip_model.text_model.parameters():
         p.requires_grad = False
     for p in clip_model.text_projection.parameters():
         p.requires_grad = False
-
-    train_vision = vision_mode != "frozen"
     for p in clip_model.vision_model.parameters():
         p.requires_grad = train_vision
     for p in clip_model.visual_projection.parameters():
@@ -522,7 +569,7 @@ def build_optimizer(clip_model, projection_head, cfg, geometry: str):
     )
 
 
-def train_one_epoch(clip_model, processor, projection_head, center, loader, optimizer, scheduler, scaler, device, geometry: str):
+def train_one_epoch(clip_model, processor, projection_head, center, loader, optimizer, scheduler, scaler, device, geometry: str, backbone_type: str):
     clip_model.train()
     projection_head.train()
     running = 0.0
@@ -530,11 +577,9 @@ def train_one_epoch(clip_model, processor, projection_head, center, loader, opti
     center = center.to(device)
 
     for images, _, _, _ in loader:
-        inputs = processor(images=images, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            feats = _to_tensor(clip_model.get_image_features(**inputs))
+            feats = _encode_image_features(clip_model, processor, images, device, backbone_type)
             proj = projection_head(feats)
             if geometry == "euclidean":
                 loss = svdd_loss_euclidean(proj, center)
@@ -555,9 +600,9 @@ def train_one_epoch(clip_model, processor, projection_head, center, loader, opti
     return running / max(n_batches, 1)
 
 
-def evaluate_test_set(clip_model, processor, projection_head, center, dataset, batch_size, device, geometry: str, thresholds: Dict[str, float], out_dir: Path, title_prefix: str):
+def evaluate_test_set(clip_model, processor, projection_head, center, dataset, batch_size, device, geometry: str, thresholds: Dict[str, float], out_dir: Path, title_prefix: str, backbone_type: str):
     labels, scores, sources, ids = compute_anomaly_scores(
-        clip_model, processor, projection_head, center, dataset, batch_size, device, geometry
+        clip_model, processor, projection_head, center, dataset, batch_size, device, geometry, backbone_type
     )
 
     real_scores = scores[labels == 0]
@@ -588,6 +633,8 @@ def evaluate_test_set(clip_model, processor, projection_head, center, dataset, b
 def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir: Path) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
+    backbone_type = cfg.get("backbone", {}).get("type", "clip")
+    open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     batch_size = int(cfg.get("batch_size", 32))
     epochs = int(cfg.get("epochs", 10))
     projection_dim = int(cfg.get("projection_dim", 256))
@@ -600,10 +647,9 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
     set_global_determinism(seed)
 
-    clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True).to(device)
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
-    configure_clip_trainability(clip_model, vision_mode)
-    feature_dim = _get_clip_image_feature_dim(clip_model)
+    clip_model, processor = _load_image_backbone(clip_model_name, backbone_type, open_clip_pretrained, device)
+    configure_clip_trainability(clip_model, vision_mode, backbone_type)
+    feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
 
     if geometry == "euclidean":
         projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
@@ -644,9 +690,9 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
     for epoch in range(1, epochs + 1):
         if geometry == "euclidean":
-            center = compute_center_euclidean(clip_model, processor, projection_head, train_ds, batch_size, device)
+            center = compute_center_euclidean(clip_model, processor, projection_head, train_ds, batch_size, device, backbone_type)
         else:
-            center = compute_center_hyperbolic(clip_model, processor, projection_head, train_ds, batch_size, device)
+            center = compute_center_hyperbolic(clip_model, processor, projection_head, train_ds, batch_size, device, backbone_type)
 
         train_loss = train_one_epoch(
             clip_model,
@@ -659,19 +705,20 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             scaler,
             device,
             geometry,
+            backbone_type,
         )
 
         if geometry == "euclidean":
-            center = compute_center_euclidean(clip_model, processor, projection_head, train_ds, batch_size, device)
+            center = compute_center_euclidean(clip_model, processor, projection_head, train_ds, batch_size, device, backbone_type)
         else:
-            center = compute_center_hyperbolic(clip_model, processor, projection_head, train_ds, batch_size, device)
+            center = compute_center_hyperbolic(clip_model, processor, projection_head, train_ds, batch_size, device, backbone_type)
 
         val_in_labels, val_in_scores, _, _ = compute_anomaly_scores(
-            clip_model, processor, projection_head, center, val_real_ds, batch_size, device, geometry
+            clip_model, processor, projection_head, center, val_real_ds, batch_size, device, geometry, backbone_type
         )
         _ = val_in_labels
         val_eval_labels, val_eval_scores, val_eval_sources, _ = compute_anomaly_scores(
-            clip_model, processor, projection_head, center, val_eval_ds, batch_size, device, geometry
+            clip_model, processor, projection_head, center, val_eval_ds, batch_size, device, geometry, backbone_type
         )
         _ = val_eval_sources
 
@@ -820,15 +867,16 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
 def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: torch.device):
     clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
+    backbone_type = cfg.get("backbone", {}).get("type", "clip")
+    open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     projection_dim = int(cfg.get("projection_dim", 256))
     curvature = float(cfg.get("curvature", 1.0))
     scale = float(cfg.get("scale", 0.1))
     vision_mode = cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune")
 
-    clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True).to(device)
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
-    configure_clip_trainability(clip_model, vision_mode)
-    feature_dim = _get_clip_image_feature_dim(clip_model)
+    clip_model, processor = _load_image_backbone(clip_model_name, backbone_type, open_clip_pretrained, device)
+    configure_clip_trainability(clip_model, vision_mode, backbone_type)
+    feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
 
     if geometry == "euclidean":
         projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
@@ -899,6 +947,7 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         Path(best_fold["checkpoint_path"]),
         device,
     )
+    backbone_type = cfg.get("backbone", {}).get("type", "clip")
     batch_size = int(cfg.get("batch_size", 32))
 
     test_results = {}
@@ -922,6 +971,7 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
             thresholds,
             test_dir,
             f"{geometry} {test_name}",
+            backbone_type,
         )
 
         payload = {
