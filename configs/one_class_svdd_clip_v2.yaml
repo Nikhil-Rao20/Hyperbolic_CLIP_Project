@@ -10,17 +10,13 @@ target_real_train_images: 500
 target_per_generator: 104
 
 clip_model_name: openai/clip-vit-base-patch16
-default_backbone: B16
+default_backbone: B32
 backbone_registry:
-  B16:
-    display_name: Hyperbolic CLIP ViT B16
-    model_name: openai/clip-vit-base-patch16
-    vision_encoder_mode: fine_tune
   B32:
     display_name: Hyperbolic CLIP ViT B32
     model_name: openai/clip-vit-base-patch32
     vision_encoder_mode: fine_tune
-  L16:
+  L14:
     display_name: Hyperbolic CLIP ViT L14 (Official Large)
     model_name: openai/clip-vit-large-patch14
     vision_encoder_mode: fine_tune
@@ -48,5 +44,4 @@ backbone:
   vision_encoder_mode: fine_tune
 
 geometries:
-  - euclidean
   - hyperbolic
