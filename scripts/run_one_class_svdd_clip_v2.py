@@ -157,11 +157,26 @@ def _load_image_backbone(backbone_name: str, backbone_type: str, open_clip_pretr
     if backbone_type == "open_clip":
         if open_clip is None:
             raise ImportError("open_clip_torch is required for open_clip backbones. Install with: pip install open_clip_torch")
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            model_name=backbone_name,
-            pretrained=open_clip_pretrained,
-            quick_gelu=True,
-        )
+
+        # Prefer *-quickgelu model defs for OpenAI pretrained tags to avoid activation-mismatch warnings.
+        candidate_names = [backbone_name]
+        if str(open_clip_pretrained).lower() == "openai" and not backbone_name.lower().endswith("-quickgelu"):
+            candidate_names = [f"{backbone_name}-quickgelu", backbone_name]
+
+        last_err = None
+        for candidate in candidate_names:
+            try:
+                model, _, preprocess = open_clip.create_model_and_transforms(
+                    model_name=candidate,
+                    pretrained=open_clip_pretrained,
+                )
+                return model.to(device), preprocess
+            except Exception as err:
+                last_err = err
+
+        if last_err is not None:
+            raise last_err
+
         return model.to(device), preprocess
 
     model = CLIPModel.from_pretrained(backbone_name, use_safetensors=True).to(device)
