@@ -143,6 +143,19 @@ def _to_tensor(output):
     return output.pooler_output if hasattr(output, "pooler_output") else output[0]
 
 
+def _get_clip_image_feature_dim(clip_model: CLIPModel) -> int:
+    # CLIP backbones can expose different image feature dimensions (e.g., B32=512, L14=768).
+    dim = getattr(getattr(clip_model, "config", None), "projection_dim", None)
+    if isinstance(dim, int) and dim > 0:
+        return dim
+
+    out_features = getattr(getattr(clip_model, "visual_projection", None), "out_features", None)
+    if isinstance(out_features, int) and out_features > 0:
+        return out_features
+
+    return 512
+
+
 def _rel_path_to_label_source(rel_path: str) -> Tuple[int, str]:
     path = Path(rel_path)
     parts_lower = [p.lower() for p in path.parts]
@@ -590,12 +603,13 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True).to(device)
     processor = CLIPProcessor.from_pretrained(clip_model_name)
     configure_clip_trainability(clip_model, vision_mode)
+    feature_dim = _get_clip_image_feature_dim(clip_model)
 
     if geometry == "euclidean":
-        projection_head = EuclideanProjectionHead(input_dim=512, projection_dim=projection_dim).to(device)
+        projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
     else:
         projection_head = HyperbolicProjectionHead(
-            input_dim=512,
+            input_dim=feature_dim,
             projection_dim=projection_dim,
             curvature=curvature,
             scale=scale,
@@ -814,12 +828,13 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     clip_model = CLIPModel.from_pretrained(clip_model_name, use_safetensors=True).to(device)
     processor = CLIPProcessor.from_pretrained(clip_model_name)
     configure_clip_trainability(clip_model, vision_mode)
+    feature_dim = _get_clip_image_feature_dim(clip_model)
 
     if geometry == "euclidean":
-        projection_head = EuclideanProjectionHead(input_dim=512, projection_dim=projection_dim).to(device)
+        projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
     else:
         projection_head = HyperbolicProjectionHead(
-            input_dim=512,
+            input_dim=feature_dim,
             projection_dim=projection_dim,
             curvature=curvature,
             scale=scale,
