@@ -109,6 +109,35 @@ def _parse_requested_backbones(backbones_arg: Sequence[str] | None) -> List[str]
     return requested
 
 
+def _parse_requested_layers(layers_arg: Sequence[str] | None) -> List[int]:
+    if not layers_arg:
+        return []
+
+    requested: List[int] = []
+    seen = set()
+    for token in layers_arg:
+        for part in str(token).split(","):
+            value = str(part).strip()
+            if not value:
+                continue
+            try:
+                layer_count = int(value)
+            except ValueError as exc:
+                raise ValueError(f"Invalid layer value '{value}'. Layers must be integers.") from exc
+            if layer_count <= 0:
+                raise ValueError(f"Invalid layer value '{value}'. Layers must be > 0.")
+            if layer_count in seen:
+                continue
+            requested.append(layer_count)
+            seen.add(layer_count)
+
+    return requested
+
+
+def _default_num_vit_layers(cfg: dict) -> int:
+    return int(cfg.get("backbone", {}).get("num_vit_layers", 12))
+
+
 def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
     cfg = copy.deepcopy(base_cfg)
     cfg["clip_model_name"] = backbone_spec["model_name"]
@@ -117,6 +146,14 @@ def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
     backbone_cfg["type"] = backbone_spec.get("type", "clip")
     backbone_cfg["open_clip_pretrained"] = backbone_spec.get("open_clip_pretrained", "openai")
     backbone_cfg["vision_encoder_mode"] = backbone_spec.get("vision_encoder_mode", backbone_cfg.get("vision_encoder_mode", "fine_tune"))
+    cfg["backbone"] = backbone_cfg
+    return cfg
+
+
+def _apply_layer_to_cfg(base_cfg: dict, num_vit_layers: int) -> dict:
+    cfg = copy.deepcopy(base_cfg)
+    backbone_cfg = dict(cfg.get("backbone", {}))
+    backbone_cfg["num_vit_layers"] = int(num_vit_layers)
     cfg["backbone"] = backbone_cfg
     return cfg
 
@@ -153,7 +190,29 @@ def _to_tensor(output):
     return output.pooler_output if hasattr(output, "pooler_output") else output[0]
 
 
-def _load_image_backbone(backbone_name: str, backbone_type: str, open_clip_pretrained: str, device: torch.device):
+def _truncate_clip_vision_layers(clip_model: CLIPModel, num_vit_layers: int) -> None:
+    layers = getattr(getattr(getattr(clip_model, "vision_model", None), "encoder", None), "layers", None)
+    if layers is None:
+        return
+
+    n_total = len(layers)
+    if num_vit_layers <= 0 or num_vit_layers >= n_total:
+        return
+
+    clip_model.vision_model.encoder.layers = nn.ModuleList(list(layers)[:num_vit_layers])
+    if hasattr(clip_model, "config") and hasattr(clip_model.config, "vision_config"):
+        clip_model.config.vision_config.num_hidden_layers = num_vit_layers
+    if hasattr(clip_model, "vision_model") and hasattr(clip_model.vision_model, "config"):
+        clip_model.vision_model.config.num_hidden_layers = num_vit_layers
+
+
+def _load_image_backbone(
+    backbone_name: str,
+    backbone_type: str,
+    open_clip_pretrained: str,
+    device: torch.device,
+    num_vit_layers: int | None = None,
+):
     if backbone_type == "open_clip":
         if open_clip is None:
             raise ImportError("open_clip_torch is required for open_clip backbones. Install with: pip install open_clip_torch")
@@ -180,6 +239,8 @@ def _load_image_backbone(backbone_name: str, backbone_type: str, open_clip_pretr
         return model.to(device), preprocess
 
     model = CLIPModel.from_pretrained(backbone_name, use_safetensors=True).to(device)
+    if isinstance(num_vit_layers, int):
+        _truncate_clip_vision_layers(model, num_vit_layers)
     processor = CLIPProcessor.from_pretrained(backbone_name)
     return model, processor
 
@@ -659,10 +720,17 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     scale = float(cfg.get("scale", 0.1))
     seed = int(cfg.get("seed", 42)) + int(fold["fold_index"]) * 100
     vision_mode = cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune")
+    num_vit_layers = int(cfg.get("backbone", {}).get("num_vit_layers", 12))
 
     set_global_determinism(seed)
 
-    clip_model, processor = _load_image_backbone(clip_model_name, backbone_type, open_clip_pretrained, device)
+    clip_model, processor = _load_image_backbone(
+        clip_model_name,
+        backbone_type,
+        open_clip_pretrained,
+        device,
+        num_vit_layers=num_vit_layers,
+    )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
 
@@ -888,8 +956,15 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     curvature = float(cfg.get("curvature", 1.0))
     scale = float(cfg.get("scale", 0.1))
     vision_mode = cfg.get("backbone", {}).get("vision_encoder_mode", "fine_tune")
+    num_vit_layers = int(cfg.get("backbone", {}).get("num_vit_layers", 12))
 
-    clip_model, processor = _load_image_backbone(clip_model_name, backbone_type, open_clip_pretrained, device)
+    clip_model, processor = _load_image_backbone(
+        clip_model_name,
+        backbone_type,
+        open_clip_pretrained,
+        device,
+        num_vit_layers=num_vit_layers,
+    )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
 
@@ -1117,6 +1192,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--layers",
+        nargs="*",
+        default=None,
+        help=(
+            "ViT layer counts to run sequentially (space/comma separated). "
+            "Example: --layers 2 4 6 8 10 or --layers 4,8,12. "
+            "If omitted, the config default num_vit_layers is used."
+        ),
+    )
+    parser.add_argument(
         "--protocol-manifest",
         type=str,
         default=None,
@@ -1142,6 +1227,15 @@ def main() -> int:
         print("[ERROR] Available backbone key(s):", ", ".join(sorted(backbone_registry.keys())), flush=True)
         return 2
 
+    try:
+        requested_layers = _parse_requested_layers(args.layers)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", flush=True)
+        return 2
+
+    default_layers = _default_num_vit_layers(cfg)
+    selected_layers = requested_layers or [default_layers]
+
     dataset_root = Path(cfg["dataset_root"])
     if not dataset_root.is_absolute():
         dataset_root = PROJECT_ROOT / dataset_root
@@ -1165,6 +1259,9 @@ def main() -> int:
                 "default_backbone": default_backbone_key,
                 "requested_backbones": requested_backbones,
                 "selected_backbones": selected_backbones,
+                "default_num_vit_layers": default_layers,
+                "requested_layers": requested_layers,
+                "selected_layers": selected_layers,
                 "available_backbones": backbone_registry,
             },
             f,
@@ -1216,84 +1313,98 @@ def main() -> int:
         cfg_for_backbone = _apply_backbone_to_cfg(cfg, backbone_spec)
 
         if len(selected_backbones) == 1 and not requested_backbones:
-            backbone_run_dir = run_dir
+            backbone_base_dir = run_dir
         else:
-            backbone_run_dir = run_dir / f"backbone_{backbone_key}"
-            backbone_run_dir.mkdir(parents=True, exist_ok=True)
+            backbone_base_dir = run_dir / f"backbone_{backbone_key}"
+            backbone_base_dir.mkdir(parents=True, exist_ok=True)
 
-        print(
-            f"[INFO] Running backbone={backbone_key} model={backbone_spec['model_name']} in {backbone_run_dir}",
-            flush=True,
-        )
+        for num_vit_layers in selected_layers:
+            cfg_for_combo = _apply_layer_to_cfg(cfg_for_backbone, num_vit_layers)
 
-        all_summary_rows = []
-        geometry_summaries = []
-        for geometry in geometries:
-            geometry_dir = backbone_run_dir / geometry
-            geometry_dir.mkdir(parents=True, exist_ok=True)
-            t0 = time.time()
-            summary = run_geometry(cfg_for_backbone, manifest, dataset_root, geometry, geometry_dir)
-            summary["elapsed_sec"] = round(time.time() - t0, 2)
-            summary["backbone_key"] = backbone_key
-            summary["clip_model_name"] = backbone_spec["model_name"]
-            geometry_summaries.append(summary)
+            if len(selected_layers) == 1 and not requested_layers:
+                combo_run_dir = backbone_base_dir
+            else:
+                combo_run_dir = backbone_base_dir / f"layer_{num_vit_layers}"
+                combo_run_dir.mkdir(parents=True, exist_ok=True)
 
-            for row in summary["summary_rows"]:
-                row_with_backbone = dict(row)
-                row_with_backbone["backbone_key"] = backbone_key
-                row_with_backbone["clip_model_name"] = backbone_spec["model_name"]
-                all_summary_rows.append(row_with_backbone)
-                multi_backbone_rows.append(row_with_backbone)
+            print(
+                f"[INFO] Running backbone={backbone_key} model={backbone_spec['model_name']} "
+                f"layers={num_vit_layers} in {combo_run_dir}",
+                flush=True,
+            )
 
-        write_summary_csv(
-            [
-                {
-                    k: v
-                    for k, v in row.items()
-                    if k
-                    in {
-                        "geometry",
-                        "test_set",
-                        "n_real",
-                        "n_fake",
-                        "auroc",
-                        "auprc",
-                        "accuracy_default",
-                        "f1_default",
-                        "sensitivity_default",
-                        "specificity_default",
-                        "accuracy_f1",
-                        "f1_f1",
-                        "sensitivity_f1",
-                        "specificity_f1",
-                        "accuracy_youden_j",
-                        "f1_youden_j",
-                        "sensitivity_youden_j",
-                        "specificity_youden_j",
+            all_summary_rows = []
+            geometry_summaries = []
+            for geometry in geometries:
+                geometry_dir = combo_run_dir / geometry
+                geometry_dir.mkdir(parents=True, exist_ok=True)
+                t0 = time.time()
+                summary = run_geometry(cfg_for_combo, manifest, dataset_root, geometry, geometry_dir)
+                summary["elapsed_sec"] = round(time.time() - t0, 2)
+                summary["backbone_key"] = backbone_key
+                summary["clip_model_name"] = backbone_spec["model_name"]
+                summary["num_vit_layers"] = num_vit_layers
+                geometry_summaries.append(summary)
+
+                for row in summary["summary_rows"]:
+                    row_with_context = dict(row)
+                    row_with_context["backbone_key"] = backbone_key
+                    row_with_context["clip_model_name"] = backbone_spec["model_name"]
+                    row_with_context["num_vit_layers"] = num_vit_layers
+                    all_summary_rows.append(row_with_context)
+                    multi_backbone_rows.append(row_with_context)
+
+            write_summary_csv(
+                [
+                    {
+                        k: v
+                        for k, v in row.items()
+                        if k
+                        in {
+                            "geometry",
+                            "test_set",
+                            "n_real",
+                            "n_fake",
+                            "auroc",
+                            "auprc",
+                            "accuracy_default",
+                            "f1_default",
+                            "sensitivity_default",
+                            "specificity_default",
+                            "accuracy_f1",
+                            "f1_f1",
+                            "sensitivity_f1",
+                            "specificity_f1",
+                            "accuracy_youden_j",
+                            "f1_youden_j",
+                            "sensitivity_youden_j",
+                            "specificity_youden_j",
+                        }
                     }
-                }
-                for row in all_summary_rows
-            ],
-            backbone_run_dir / "final_8run_summary.csv",
-        )
-        with (backbone_run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
-            json.dump(
+                    for row in all_summary_rows
+                ],
+                combo_run_dir / "final_8run_summary.csv",
+            )
+            with (combo_run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "backbone_key": backbone_key,
+                        "clip_model_name": backbone_spec["model_name"],
+                        "num_vit_layers": num_vit_layers,
+                        "geometries": geometry_summaries,
+                    },
+                    f,
+                    indent=2,
+                )
+
+            multi_backbone_runs.append(
                 {
                     "backbone_key": backbone_key,
                     "clip_model_name": backbone_spec["model_name"],
-                    "geometries": geometry_summaries,
-                },
-                f,
-                indent=2,
+                    "num_vit_layers": num_vit_layers,
+                    "run_dir": combo_run_dir.as_posix(),
+                }
             )
-
-        multi_backbone_runs.append(
-            {
-                "backbone_key": backbone_key,
-                "clip_model_name": backbone_spec["model_name"],
-                "run_dir": backbone_run_dir.as_posix(),
-            }
-        )
 
     with (run_dir / "run_summary_multi_backbone.json").open("w", encoding="utf-8") as f:
         json.dump(
@@ -1305,10 +1416,11 @@ def main() -> int:
             indent=2,
         )
 
-    if len(selected_backbones) > 1:
+    if len(selected_backbones) > 1 or len(selected_layers) > 1:
         fieldnames = [
             "backbone_key",
             "clip_model_name",
+            "num_vit_layers",
             "geometry",
             "test_set",
             "n_real",

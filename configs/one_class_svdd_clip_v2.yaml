@@ -10,8 +10,12 @@ target_real_train_images: 500
 target_per_generator: 104
 
 clip_model_name: openai/clip-vit-base-patch16
-default_backbone: B32
+default_backbone: B16
 backbone_registry:
+  B16:
+    display_name: Hyperbolic CLIP ViT B16
+    model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: fine_tune
   B32:
     display_name: Hyperbolic CLIP ViT B32
     model_name: openai/clip-vit-base-patch32
@@ -44,6 +48,7 @@ threshold_modes:
 backbone:
   model_name: openai/clip-vit-base-patch16
   vision_encoder_mode: fine_tune
+  num_vit_layers: 12
 
 geometries:
   - hyperbolic
