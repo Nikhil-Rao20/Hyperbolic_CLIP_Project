@@ -82,8 +82,11 @@ def encode_image_features(clip_model, processor, images, device):
     inputs = processor(images=images, return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
-        features = clip_model.get_image_features(**inputs)
-    return features
+        output = clip_model.get_image_features(**inputs)
+    # Extract pooled_output tensor from BaseModelOutputWithPooling
+    if isinstance(output, torch.Tensor):
+        return output
+    return output.pooler_output if hasattr(output, "pooler_output") else output[0]
 
 
 class CLIPClassificationHead(nn.Module):
@@ -182,7 +185,8 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
 
     # --- STEP A: Build datasets ---
     train_real_ids = fold["train_ids"]
-    train_fake_ids = manifest["supervised_baseline"]["fake_train_ids"]
+    # Balance: use only as many fake as real for proper supervised learning
+    train_fake_ids = manifest["supervised_baseline"]["fake_train_ids"][:len(train_real_ids)]
     train_ds = ManifestSupervisedDataset(dataset_root, train_real_ids, train_fake_ids)
 
     val_real_ids, val_fake_ids = split_real_fake(fold["val_eval_ids"])
@@ -242,7 +246,9 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
             # Encode via CLIPProcessor
             inputs = processor(images=images, return_tensors="pt", padding=True)
             inputs = {k: v.to(device) for k, v in inputs.items()}
-            features = clip_model.get_image_features(**inputs)
+            output = clip_model.get_image_features(**inputs)
+            # Extract tensor from BaseModelOutputWithPooling
+            features = output.pooler_output if hasattr(output, "pooler_output") else output[0]
 
             logits = head(features)
             loss = criterion(logits, labels)
@@ -273,7 +279,9 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
                 labels = labels.to(device)
                 inputs = processor(images=images, return_tensors="pt", padding=True)
                 inputs = {k: v.to(device) for k, v in inputs.items()}
-                features = clip_model.get_image_features(**inputs)
+                output = clip_model.get_image_features(**inputs)
+                # Extract tensor from BaseModelOutputWithPooling
+                features = output.pooler_output if hasattr(output, "pooler_output") else output[0]
                 logits = head(features)
                 probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
                 val_labels.extend(labels.cpu().numpy().tolist())
@@ -334,7 +342,9 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
             for images, labels in test_loader:
                 inputs = processor(images=images, return_tensors="pt", padding=True)
                 inputs = {k: v.to(device) for k, v in inputs.items()}
-                features = clip_model.get_image_features(**inputs)
+                output = clip_model.get_image_features(**inputs)
+                # Extract tensor from BaseModelOutputWithPooling
+                features = output.pooler_output if hasattr(output, "pooler_output") else output[0]
                 logits = head(features)
                 probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
                 test_labels.extend(labels.numpy().tolist())
