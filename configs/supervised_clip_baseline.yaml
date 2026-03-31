@@ -1,0 +1,33 @@
+# Supervised CLIP ViT B16 Baseline
+# Binary cross-entropy classifier — supervised upper bound comparison
+# All hyperparameters matched exactly to one_class_svdd_clip_v2.yaml
+
+dataset_root: RGIIIT_clean
+output_root: experiments/Supervised_Baseline
+run_name: supervised_clip_baseline
+
+seed: 42
+n_folds: 5
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+
+clip_model_name: openai/clip-vit-base-patch16
+
+variants:
+  linear_probe:
+    display_name: "CLIP ViT B16 Linear Probe (Supervised)"
+    freeze_backbone: true
+  full_finetune:
+    display_name: "CLIP ViT B16 Full Fine-tune (Supervised)"
+    freeze_backbone: false
+
+# Matched exactly to SVDD config
+batch_size: 32
+epochs: 10
+num_workers: 0
+projection_dim: 256
+lr_backbone: 1.0e-5
+lr_head: 1.0e-4
+weight_decay: 1.0e-4
+num_classes: 2
+label_real: 0
+label_fake: 1
