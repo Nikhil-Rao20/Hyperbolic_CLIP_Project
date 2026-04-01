@@ -11,6 +11,7 @@ import csv
 import random
 import traceback
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -71,6 +72,87 @@ def split_real_fake(id_list: list):
     real_ids = [p for p in id_list if "/Real/" in p.replace("\\", "/")]
     fake_ids = [p for p in id_list if "/Fake/" in p.replace("\\", "/")]
     return real_ids, fake_ids
+
+
+def _fake_subject_key(rel_path: str) -> str:
+    """Return a stable subject-level key for a fake image path."""
+    normalized = rel_path.replace("\\", "/")
+    stem = Path(normalized).stem
+    parts_lower = [part.lower() for part in Path(normalized).parts]
+
+    if stem.startswith("GAN__"):
+        generator = "GAN"
+        source = "GAN"
+        tail = stem.split("__", 1)[1]
+    elif stem.startswith("LDM__"):
+        generator = "LDM"
+        source = "LDM"
+        tail = stem.split("__", 1)[1]
+    elif stem.startswith("MLS_") or stem.startswith("MLS__"):
+        generator = "MLS"
+        source = stem.split("__", 1)[0] if "__" in stem else stem.split("_", 1)[0]
+        tail = stem.split("__", 1)[1] if "__" in stem else stem.split("_", 1)[1]
+    elif any("gan" in part for part in parts_lower):
+        generator = "GAN"
+        source = "GAN"
+        tail = stem
+    elif any("ldm" in part for part in parts_lower):
+        generator = "LDM"
+        source = "LDM"
+        tail = stem
+    elif any("mls" in part for part in parts_lower):
+        generator = "MLS"
+        source = "MLS"
+        tail = stem
+    else:
+        generator = "Fake"
+        source = "unknown"
+        tail = stem
+
+    if "_slice" in tail:
+        tail = tail.rsplit("_slice", 1)[0]
+    return f"{generator}::{source}::{tail}"
+
+
+def select_grouped_fake_subset(fake_ids: list, target_count: int, seed: int) -> list:
+    """Select an exact-sized fake subset while keeping subject-level groups intact."""
+    grouped = defaultdict(list)
+    for rel_path in fake_ids:
+        grouped[_fake_subject_key(rel_path)].append(rel_path)
+
+    group_items = [(subject_id, sorted(paths)) for subject_id, paths in grouped.items()]
+    rng = random.Random(seed)
+    rng.shuffle(group_items)
+    group_items.sort(key=lambda item: len(item[1]), reverse=True)
+
+    reachable = {0: []}
+    for subject_id, paths in group_items:
+        group_size = len(paths)
+        next_reachable = dict(reachable)
+        for total_count, chosen_subjects in reachable.items():
+            new_total = total_count + group_size
+            if new_total <= target_count and new_total not in next_reachable:
+                next_reachable[new_total] = chosen_subjects + [subject_id]
+        reachable = next_reachable
+        if target_count in reachable:
+            break
+
+    if target_count not in reachable:
+        raise RuntimeError(
+            f"Could not find an exact subject-level fake subset of size {target_count}."
+        )
+
+    selected_subjects = reachable[target_count]
+    selected = []
+    for subject_id in selected_subjects:
+        selected.extend(grouped[subject_id])
+
+    if len(selected) != target_count:
+        raise RuntimeError(
+            f"Expected {target_count} fake images but selected {len(selected)}."
+        )
+
+    return selected
 
 
 def encode_image_features(clip_model, processor, images, device):
@@ -182,11 +264,15 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
     epochs = int(cfg.get("epochs", 10))
     projection_dim = int(cfg.get("projection_dim", 256))
     clip_model_name = cfg.get("clip_model_name", "openai/clip-vit-base-patch16")
+    selected_fake_ids = select_grouped_fake_subset(
+        manifest["supervised_baseline"]["fake_train_ids"],
+        target_count=len(fold["train_ids"]),
+        seed=int(cfg.get("seed", 42)),
+    )
 
     # --- STEP A: Build datasets ---
     train_real_ids = fold["train_ids"]
-    # Balance: use only as many fake as real for proper supervised learning
-    train_fake_ids = manifest["supervised_baseline"]["fake_train_ids"][:len(train_real_ids)]
+    train_fake_ids = selected_fake_ids
     train_ds = ManifestSupervisedDataset(dataset_root, train_real_ids, train_fake_ids)
 
     val_real_ids, val_fake_ids = split_real_fake(fold["val_eval_ids"])
@@ -201,6 +287,11 @@ def run_fold(fold: dict, manifest: dict, cfg: dict, freeze_backbone: bool,
 
     print(f"[INFO]   Train: {len(train_ds)} images "
           f"({len(train_real_ids)} real + {len(train_fake_ids)} fake)", flush=True)
+    if len(train_real_ids) != len(train_fake_ids):
+        raise RuntimeError(
+            f"Unbalanced training set for fold {fold_index}: "
+            f"{len(train_real_ids)} real vs {len(train_fake_ids)} fake"
+        )
     print(f"[INFO]   Val:   {len(val_ds)} images "
           f"({len(val_real_ids)} real + {len(val_fake_ids)} fake)", flush=True)
 
