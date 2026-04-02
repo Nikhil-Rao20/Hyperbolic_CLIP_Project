@@ -1,0 +1,18 @@
+# Ablation: CLIP + Projection without training
+# Tests whether learned projection is essential vs random projection
+# Identical to SVDD config except no training occurs
+
+dataset_root: RGIIIT_clean
+output_root: experiments/Ablation_NoTraining
+run_name: ablation_clip_random_projection
+
+seed: 42
+n_folds: 5
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+
+clip_model_name: openai/clip-vit-base-patch16
+batch_size: 32
+num_workers: 0
+projection_dim: 256
+curvature: 1.0
+scale: 0.1
