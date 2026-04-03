@@ -10,9 +10,11 @@ THIRD_PARTY = PROJECT_ROOT / "third_party"
 
 WINCLIP_REPO = "https://github.com/mala-lab/WinCLIP.git"
 ANOMALYCLIP_REPO = "https://github.com/zqhang/AnomalyCLIP.git"
+SIMPLENET_REPO = "https://github.com/DonaldRR/SimpleNet.git"
 
 WINCLIP_DIR = THIRD_PARTY / "WinCLIP"
 ANOMALYCLIP_DIR = THIRD_PARTY / "AnomalyCLIP"
+SIMPLENET_DIR = THIRD_PARTY / "SimpleNet"
 
 WINCLIP_CHECKPOINT_URL = (
     "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/"
@@ -61,7 +63,7 @@ def _ensure_winclip_checkpoint(download_if_missing: bool) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Set up official WinCLIP and AnomalyCLIP baseline dependencies")
+    parser = argparse.ArgumentParser(description="Set up official baseline dependencies (WinCLIP, AnomalyCLIP, SimpleNet)")
     parser.add_argument("--clone-depth", type=int, default=1, help="Depth for git clone (use 0 for full history)")
     parser.add_argument(
         "--skip-checkpoint-download",
@@ -74,6 +76,7 @@ def main() -> int:
 
     _ensure_repo(WINCLIP_DIR, WINCLIP_REPO, depth)
     _ensure_repo(ANOMALYCLIP_DIR, ANOMALYCLIP_REPO, depth)
+    _ensure_repo(SIMPLENET_DIR, SIMPLENET_REPO, depth)
     _ensure_winclip_datasets_package_marker()
     _ensure_winclip_checkpoint(download_if_missing=not args.skip_checkpoint_download)
 

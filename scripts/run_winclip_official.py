@@ -32,6 +32,7 @@ WINCLIP_CHECKPOINT_URL = "https://github.com/mlfoundations/open_clip/releases/do
 WINCLIP_CHECKPOINT_NAME = "vit_b_16_plus_240-laion400m_e31-8fb26589.pt"
 DEFAULT_CHECKPOINT = THIRD_PARTY_WINCLIP / WINCLIP_CHECKPOINT_NAME
 DEFAULT_SCORE_THRESHOLD = 0.5
+DEFAULT_THRESHOLD_PERCENTILE = 95.0
 TEST_SET_ORDER = ["test_allfake", "test_gan", "test_ldm", "test_mls"]
 SUMMARY_METRIC_KEYS = [
     "auroc",
@@ -399,17 +400,17 @@ def run_official_winclip(
     output_root: Path,
     object_name: str = "candle",
     shot: int = 0,
+    threshold_percentile: float = DEFAULT_THRESHOLD_PERCENTILE,
     num_workers: int = 0,
     checkpoint_path: Path = DEFAULT_CHECKPOINT,
     device: str = "auto",
 ) -> int:
     if shot < 0:
         raise ValueError("shot must be >= 0")
+    if not (0.0 < float(threshold_percentile) < 100.0):
+        raise ValueError("threshold_percentile must be between 0 and 100")
     device = _validate_device_mode(device)
     manifest = _load_manifest(manifest_path)
-    support_real_ids = list(manifest.get("real_train", {}).get("image_ids", []))
-    if shot > 0 and len(support_real_ids) == 0:
-        raise ValueError("Few-shot mode requires manifest real_train.image_ids, but none were found")
 
     module = _load_winclip_module()
     checkpoint = _ensure_checkpoint(checkpoint_path)
@@ -422,6 +423,128 @@ def run_official_winclip(
         fold_index = int(fold["fold_index"])
         fold_dir = run_dir / f"fold_{fold_index}"
         fold_dir.mkdir(parents=True, exist_ok=True)
+
+        support_real_ids = list(fold.get("train_ids", []))
+        if shot > 0 and len(support_real_ids) == 0:
+            raise ValueError(f"Few-shot mode requires fold train_ids, but fold {fold_index} has none")
+
+        # Calibrate fold-level thresholds once, then reuse for all test sets in the fold.
+        # default -> val_ids real scores percentile; f1/youden_j -> val_eval_ids.
+        val_real_rel_paths = sorted(list(fold["val_ids"]))
+        val_eval_rel_paths = sorted(list(fold["val_eval_ids"]))
+
+        with tempfile.TemporaryDirectory(prefix=f"winclip_{fold_index}_val_real_") as tmp_dir:
+            temp_root = Path(tmp_dir) / "dataset"
+            _build_mvtec_like_dataset(
+                dataset_root,
+                val_real_rel_paths,
+                object_name,
+                temp_root,
+                create_train=(shot > 0),
+                train_rel_paths=support_real_ids if shot > 0 else None,
+            )
+
+            val_real_config = {
+                "datasetname": temp_root.name,
+                "dataset_root_dir": temp_root.parent.as_posix(),
+                "data_dir": temp_root.as_posix(),
+                "obj_type_id": 0,
+                "obj_type": object_name,
+                "shot": int(shot),
+                "num_workers": int(num_workers),
+                "device": device,
+            }
+
+            cwd_before = Path.cwd()
+            try:
+                os.chdir(THIRD_PARTY_WINCLIP)
+                val_real_gt_list, val_real_score_list, _, _, _ = module.run(val_real_config)
+            finally:
+                os.chdir(cwd_before)
+
+        with tempfile.TemporaryDirectory(prefix=f"winclip_{fold_index}_val_eval_") as tmp_dir:
+            temp_root = Path(tmp_dir) / "dataset"
+            _build_mvtec_like_dataset(
+                dataset_root,
+                val_eval_rel_paths,
+                object_name,
+                temp_root,
+                create_train=(shot > 0),
+                train_rel_paths=support_real_ids if shot > 0 else None,
+            )
+
+            val_config = {
+                "datasetname": temp_root.name,
+                "dataset_root_dir": temp_root.parent.as_posix(),
+                "data_dir": temp_root.as_posix(),
+                "obj_type_id": 0,
+                "obj_type": object_name,
+                "shot": int(shot),
+                "num_workers": int(num_workers),
+                "device": device,
+            }
+
+            cwd_before = Path.cwd()
+            try:
+                os.chdir(THIRD_PARTY_WINCLIP)
+                val_gt_list, val_score_list, _, _, _ = module.run(val_config)
+            finally:
+                os.chdir(cwd_before)
+
+        val_real_labels, val_real_scores = _to_numpy_labels_scores(val_real_gt_list, val_real_score_list)
+        val_labels, val_scores = _to_numpy_labels_scores(val_gt_list, val_score_list)
+        val_real_scores = val_real_scores[val_real_labels == 0]
+        if val_real_scores.size == 0:
+            raise RuntimeError(f"Fold {fold_index} has no real samples in val_ids for default threshold calibration")
+
+        default_threshold = float(np.percentile(val_real_scores, float(threshold_percentile)))
+        thresholds = _calibrate_thresholds(val_labels, val_scores, default_threshold=default_threshold)
+
+        val_threshold_results: Dict[str, Dict] = {}
+        val_threshold_rows: List[Dict] = []
+        for threshold_name in ["default", "f1", "youden_j"]:
+            threshold = float(thresholds[threshold_name])
+            metrics = _compute_metrics(val_labels, val_scores, threshold)
+            val_threshold_results[threshold_name] = metrics
+            val_threshold_rows.append(
+                {
+                    "threshold_name": threshold_name,
+                    "threshold_value": threshold,
+                    "accuracy": metrics["accuracy"],
+                    "precision": metrics["precision"],
+                    "recall": metrics["recall"],
+                    "f1": metrics["f1"],
+                    "sensitivity": metrics["sensitivity"],
+                    "specificity": metrics["specificity"],
+                    "PPV": metrics["PPV"],
+                    "NPV": metrics["NPV"],
+                    "auroc": metrics["auroc"],
+                    "auprc": metrics["auprc"],
+                }
+            )
+        with (fold_dir / "val_threshold_metrics.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "threshold_name",
+                    "threshold_value",
+                    "accuracy",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "sensitivity",
+                    "specificity",
+                    "PPV",
+                    "NPV",
+                    "auroc",
+                    "auprc",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(val_threshold_rows)
+        for threshold_name in ["default", "f1", "youden_j"]:
+            with (fold_dir / f"val_classification_report_{threshold_name}.json").open("w", encoding="utf-8") as f:
+                json.dump(val_threshold_results[threshold_name]["classification_report"], f, indent=2)
 
         for test_name in TEST_SET_ORDER:
             test_spec = manifest["test_sets"][test_name]
@@ -457,7 +580,6 @@ def run_official_winclip(
                     os.chdir(cwd_before)
 
             labels, scores = _to_numpy_labels_scores(gt_list, score_list)
-            thresholds = _calibrate_thresholds(labels, scores, default_threshold=DEFAULT_SCORE_THRESHOLD)
             threshold_results: Dict[str, Dict] = {}
             threshold_metrics_rows: List[Dict] = []
             for threshold_name in ["default", "f1", "youden_j"]:
@@ -506,7 +628,14 @@ def run_official_winclip(
                         "threshold_results": threshold_results,
                         "official_repo": "mala-lab/WinCLIP",
                         "checkpoint": checkpoint.as_posix(),
+                        "object_name": object_name,
                         "shot": int(shot),
+                        "threshold_percentile": float(threshold_percentile),
+                        "calibration_split": {
+                            "default": "fold.val_ids",
+                            "f1": "fold.val_eval_ids",
+                            "youden_j": "fold.val_eval_ids",
+                        },
                         "device": device,
                     },
                     f,
@@ -531,8 +660,14 @@ def run_official_winclip(
         json.dump(
             {
                 "official_repo": "mala-lab/WinCLIP",
+                "object_name": object_name,
                 "shot": int(shot),
-                "default_threshold": DEFAULT_SCORE_THRESHOLD,
+                "threshold_percentile": float(threshold_percentile),
+                "calibration_split": {
+                    "default": "fold.val_ids",
+                    "f1": "fold.val_eval_ids",
+                    "youden_j": "fold.val_eval_ids",
+                },
                 "n_folds": len(manifest.get("cv_folds", [])),
                 "summary_rows_per_fold": fold_summary_rows,
                 "summary_rows_mean_std": mean_std_rows,
@@ -552,6 +687,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=str, default="experiments/WinCLIP_Official")
     parser.add_argument("--object-name", type=str, default="candle")
     parser.add_argument("--shot", type=int, default=0)
+    parser.add_argument("--threshold-percentile", type=float, default=DEFAULT_THRESHOLD_PERCENTILE)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--checkpoint-path", type=str, default=DEFAULT_CHECKPOINT.as_posix())
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -577,6 +713,7 @@ def main() -> int:
         output_root,
         object_name=args.object_name,
         shot=args.shot,
+        threshold_percentile=args.threshold_percentile,
         num_workers=args.num_workers,
         checkpoint_path=checkpoint_path,
         device=args.device,
