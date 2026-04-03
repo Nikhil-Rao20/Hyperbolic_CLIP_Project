@@ -37,6 +37,17 @@ def _ensure_repo(path: Path, url: str, depth: int | None) -> None:
     _run(cmd)
 
 
+def _ensure_winclip_datasets_package_marker() -> None:
+    marker = WINCLIP_DIR / "datasets" / "__init__.py"
+    if marker.exists():
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        "# Auto-created by setup_official_baselines.py for deterministic local imports.\n",
+        encoding="utf-8",
+    )
+
+
 def _ensure_winclip_checkpoint(download_if_missing: bool) -> None:
     WINCLIP_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
     if WINCLIP_CHECKPOINT.exists():
@@ -63,6 +74,7 @@ def main() -> int:
 
     _ensure_repo(WINCLIP_DIR, WINCLIP_REPO, depth)
     _ensure_repo(ANOMALYCLIP_DIR, ANOMALYCLIP_REPO, depth)
+    _ensure_winclip_datasets_package_marker()
     _ensure_winclip_checkpoint(download_if_missing=not args.skip_checkpoint_download)
 
     if not ANOMALYCLIP_CHECKPOINT.exists():

@@ -55,6 +55,23 @@ def _ensure_checkpoint(checkpoint_path: Path) -> Path:
     return checkpoint_path
 
 
+def _ensure_winclip_package_markers() -> None:
+    datasets_init = THIRD_PARTY_WINCLIP / "datasets" / "__init__.py"
+    if datasets_init.exists():
+        return
+    datasets_init.parent.mkdir(parents=True, exist_ok=True)
+    datasets_init.write_text(
+        "# Auto-created by run_winclip_official.py for deterministic local imports.\n",
+        encoding="utf-8",
+    )
+
+
+def _clear_shadowed_modules(prefixes: Sequence[str]) -> None:
+    for name in list(sys.modules.keys()):
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
+            sys.modules.pop(name, None)
+
+
 def _validate_device_mode(device: str) -> str:
     mode = device.lower()
     if mode not in {"auto", "cpu", "cuda"}:
@@ -71,22 +88,21 @@ def _load_winclip_module():
             f"WinCLIP official source not found at {module_path}. "
             "Run: python scripts/setup_official_baselines.py"
         )
+
+    _ensure_winclip_package_markers()
+
+    winclip_path = THIRD_PARTY_WINCLIP.as_posix()
+    if winclip_path not in sys.path:
+        sys.path.insert(0, winclip_path)
+
+    # Avoid collisions with globally installed packages (e.g. huggingface datasets).
+    _clear_shadowed_modules(["datasets", "open_clip", "binary_focal_loss"])
+
     spec = importlib.util.spec_from_file_location("third_party_winclip_main", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not import WinCLIP entry point from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    sys_path_added = False
-    if THIRD_PARTY_WINCLIP.as_posix() not in sys.path:
-        sys.path.insert(0, THIRD_PARTY_WINCLIP.as_posix())
-        sys_path_added = True
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        if sys_path_added:
-            try:
-                sys.path.remove(THIRD_PARTY_WINCLIP.as_posix())
-            except ValueError:
-                pass
+    spec.loader.exec_module(module)
     return module
 
 
