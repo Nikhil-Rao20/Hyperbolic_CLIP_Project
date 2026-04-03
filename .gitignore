@@ -39,6 +39,7 @@ RGIIIT_clean/
 
 # Cloned repos
 Hyperbolic_CLIP/
+third_party/
 
 # ─── Image / binary data files ───
 *.png
