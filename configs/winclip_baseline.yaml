@@ -1,0 +1,21 @@
+# Official WinCLIP wrapper config
+# Entry script: scripts/run_winclip_baseline.py
+# Under the hood this runs the upstream repository in third_party/WinCLIP.
+
+dataset_root: RGIIIT_clean
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+output_root: experiments/WinCLIP_Official
+checkpoint_path: third_party/WinCLIP/vit_b_16_plus_240-laion400m_e31-8fb26589.pt
+
+# Object category name consumed by the official WinCLIP MVTec-style loader.
+# This is a label token in prompt construction, not a hard dataset class filter in our bridge.
+object_name: candle
+
+# WinCLIP mode: 0 = zero-shot, >0 = few-shot with support images from manifest real_train pool.
+shot: 0
+
+# CPU-safe default for slower systems.
+num_workers: 0
+
+# auto selects CUDA when available, otherwise CPU.
+device: auto

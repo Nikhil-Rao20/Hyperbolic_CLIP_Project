@@ -1,0 +1,41 @@
+dataset_root: RGIIIT_clean
+output_root: experiments/Hyperbolic_Anomaly_Baseline
+run_name: hyperbolic_anomaly_baseline
+
+seed: 42
+n_folds: 5
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+
+target_real_train_images: 500
+target_per_generator: 104
+
+clip_model_name: openai/clip-vit-base-patch16
+default_backbone: B16
+backbone_registry:
+  B16:
+    display_name: Hyperbolic CLIP ViT B16
+    model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: fine_tune
+
+batch_size: 32
+epochs: 10
+num_workers: 0
+projection_dim: 256
+threshold_percentile: 95
+lr_image: 1.0e-5
+lr_projection: 1.0e-4
+weight_decay: 1.0e-4
+curvature: 1.0
+scale: 0.1
+
+threshold_modes:
+  - youden_j
+  - f1
+
+backbone:
+  model_name: openai/clip-vit-base-patch16
+  vision_encoder_mode: fine_tune
+  num_vit_layers: 12
+
+geometries:
+  - hyperbolic

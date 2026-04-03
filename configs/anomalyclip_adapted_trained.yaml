@@ -1,0 +1,29 @@
+# Adapted AnomalyCLIP training config (image-level prompt tuning)
+# Entry script: scripts/run_anomalyclip_adapted_trained.py
+# This variant is intentionally separate from the official test-only baseline.
+
+dataset_root: RGIIIT_clean
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+output_root: experiments/AnomalyCLIP_Adapted_Trained
+run_name: anomalyclip_adapted_trained
+
+seed: 111
+device: auto
+
+# Training hyperparameters for prompt learner adaptation.
+epochs: 15
+batch_size: 8
+learning_rate: 1.0e-3
+num_workers: 0
+
+# AnomalyCLIP model/prompt settings.
+image_size: 518
+depth: 9
+n_ctx: 12
+t_n_ctx: 4
+features_list: [6, 12, 18, 24]
+
+# Evaluation settings.
+dataset_name: ISBI
+class_name: skin
+metrics: image-level

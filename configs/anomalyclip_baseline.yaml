@@ -1,0 +1,20 @@
+# Official AnomalyCLIP wrapper config
+# Entry script: scripts/run_anomalyclip_baseline.py
+# Under the hood this runs the upstream repository in third_party/AnomalyCLIP.
+
+dataset_root: RGIIIT_clean
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+output_root: experiments/AnomalyCLIP_Official
+
+# Official AnomalyCLIP checkpoint used by test.py
+checkpoint_path: third_party/AnomalyCLIP/checkpoints/9_12_4_multiscale_visa/epoch_15.pth
+
+# Dataset/class naming expected by the official codebase mappings.
+dataset_name: ISBI
+class_name: skin
+
+# image-level is used for protocol-level binary anomaly evaluation.
+metrics: image-level
+
+# auto selects CUDA when available, otherwise CPU.
+device: auto
