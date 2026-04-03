@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import os
@@ -8,22 +9,268 @@ import shutil
 import sys
 import tempfile
 import urllib.request
-from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
+import numpy as np
 import torch
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 THIRD_PARTY_WINCLIP = PROJECT_ROOT / "third_party" / "WinCLIP"
 WINCLIP_CHECKPOINT_URL = "https://github.com/mlfoundations/open_clip/releases/download/v0.2-weights/vit_b_16_plus_240-laion400m_e31-8fb26589.pt"
 WINCLIP_CHECKPOINT_NAME = "vit_b_16_plus_240-laion400m_e31-8fb26589.pt"
 DEFAULT_CHECKPOINT = THIRD_PARTY_WINCLIP / WINCLIP_CHECKPOINT_NAME
+DEFAULT_SCORE_THRESHOLD = 0.5
+TEST_SET_ORDER = ["test_allfake", "test_gan", "test_ldm", "test_mls"]
+SUMMARY_METRIC_KEYS = [
+    "auroc",
+    "auprc",
+    "accuracy_default",
+    "precision_default",
+    "recall_default",
+    "f1_default",
+    "sensitivity_default",
+    "specificity_default",
+    "PPV_default",
+    "NPV_default",
+    "accuracy_f1",
+    "precision_f1",
+    "recall_f1",
+    "f1_f1",
+    "sensitivity_f1",
+    "specificity_f1",
+    "PPV_f1",
+    "NPV_f1",
+    "accuracy_youden_j",
+    "precision_youden_j",
+    "recall_youden_j",
+    "f1_youden_j",
+    "sensitivity_youden_j",
+    "specificity_youden_j",
+    "PPV_youden_j",
+    "NPV_youden_j",
+]
 
 
 def _load_manifest(manifest_path: Path) -> dict:
     with manifest_path.open("r", encoding="utf-8-sig") as f:
         return json.load(f)
+
+
+def _to_numpy_labels_scores(gt_list: Sequence, score_list: Sequence) -> tuple[np.ndarray, np.ndarray]:
+    labels = np.array([int(np.asarray(v).item()) for v in gt_list], dtype=np.int64)
+    scores = np.array([float(np.asarray(v).item()) for v in score_list], dtype=np.float64)
+    if labels.shape[0] != scores.shape[0]:
+        raise RuntimeError("WinCLIP returned mismatched labels and scores lengths")
+    if labels.shape[0] == 0:
+        raise RuntimeError("WinCLIP returned empty labels/scores")
+    return labels, scores
+
+
+def _predict_from_threshold(scores: np.ndarray, threshold: float) -> np.ndarray:
+    return (scores > threshold).astype(np.int64)
+
+
+def _compute_metrics(labels: np.ndarray, scores: np.ndarray, threshold: float) -> Dict:
+    preds = _predict_from_threshold(scores, threshold)
+    out = {
+        "accuracy": float(accuracy_score(labels, preds)),
+        "precision": float(precision_score(labels, preds, zero_division=0)),
+        "recall": float(recall_score(labels, preds, zero_division=0)),
+        "f1": float(f1_score(labels, preds, zero_division=0)),
+    }
+
+    try:
+        out["auroc"] = float(roc_auc_score(labels, scores))
+    except ValueError:
+        out["auroc"] = 0.0
+    try:
+        out["auprc"] = float(average_precision_score(labels, scores))
+    except ValueError:
+        out["auprc"] = 0.0
+
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    tn, fp, fn, tp = [int(v) for v in cm.ravel()]
+    out["confusion_matrix"] = cm.tolist()
+    out["specificity"] = round(tn / (tn + fp), 4) if (tn + fp) > 0 else 0.0
+    out["sensitivity"] = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+    out["PPV"] = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+    out["NPV"] = round(tn / (tn + fn), 4) if (tn + fn) > 0 else 0.0
+    out["classification_report"] = classification_report(
+        labels,
+        preds,
+        labels=[0, 1],
+        target_names=["Real", "Fake"],
+        output_dict=True,
+        zero_division=0,
+    )
+    return out
+
+
+def _calibrate_thresholds(labels: np.ndarray, scores: np.ndarray, default_threshold: float) -> Dict[str, float]:
+    uniq = np.unique(scores)
+    candidates = uniq if len(uniq) < 200 else np.unique(np.quantile(scores, np.linspace(0.01, 0.99, 200)))
+    if len(candidates) == 0:
+        raise RuntimeError("No threshold candidates available for WinCLIP metrics calibration")
+
+    best_f1 = {"threshold": float(candidates[0]), "f1": -1.0}
+    best_j = {"threshold": float(candidates[0]), "youden_j": -2.0}
+
+    for th in candidates:
+        preds = _predict_from_threshold(scores, float(th))
+        f1 = float(f1_score(labels, preds, zero_division=0))
+        rec = float(recall_score(labels, preds, zero_division=0))
+        spe = float(recall_score(labels, preds, pos_label=0, zero_division=0))
+        j = rec + spe - 1.0
+        if f1 > best_f1["f1"]:
+            best_f1 = {"threshold": float(th), "f1": f1}
+        if j > best_j["youden_j"]:
+            best_j = {"threshold": float(th), "youden_j": j}
+
+    return {
+        "default": float(default_threshold),
+        "f1": float(best_f1["threshold"]),
+        "youden_j": float(best_j["threshold"]),
+    }
+
+
+def _build_fold_summary_row(fold_index: int, test_name: str, test_spec: dict, threshold_results: Dict[str, Dict]) -> Dict:
+    default_metrics = threshold_results["default"]
+    f1_metrics = threshold_results["f1"]
+    j_metrics = threshold_results["youden_j"]
+    return {
+        "geometry": "winclip_official",
+        "fold_index": int(fold_index),
+        "test_set": test_name,
+        "n_real": int(test_spec["n_real"]),
+        "n_fake": int(test_spec["n_fake"]),
+        "auroc": round(default_metrics["auroc"], 6),
+        "auprc": round(default_metrics["auprc"], 6),
+        "accuracy_default": round(default_metrics["accuracy"], 6),
+        "precision_default": round(default_metrics["precision"], 6),
+        "recall_default": round(default_metrics["recall"], 6),
+        "f1_default": round(default_metrics["f1"], 6),
+        "sensitivity_default": round(default_metrics["sensitivity"], 6),
+        "specificity_default": round(default_metrics["specificity"], 6),
+        "PPV_default": round(default_metrics["PPV"], 6),
+        "NPV_default": round(default_metrics["NPV"], 6),
+        "accuracy_f1": round(f1_metrics["accuracy"], 6),
+        "precision_f1": round(f1_metrics["precision"], 6),
+        "recall_f1": round(f1_metrics["recall"], 6),
+        "f1_f1": round(f1_metrics["f1"], 6),
+        "sensitivity_f1": round(f1_metrics["sensitivity"], 6),
+        "specificity_f1": round(f1_metrics["specificity"], 6),
+        "PPV_f1": round(f1_metrics["PPV"], 6),
+        "NPV_f1": round(f1_metrics["NPV"], 6),
+        "accuracy_youden_j": round(j_metrics["accuracy"], 6),
+        "precision_youden_j": round(j_metrics["precision"], 6),
+        "recall_youden_j": round(j_metrics["recall"], 6),
+        "f1_youden_j": round(j_metrics["f1"], 6),
+        "sensitivity_youden_j": round(j_metrics["sensitivity"], 6),
+        "specificity_youden_j": round(j_metrics["specificity"], 6),
+        "PPV_youden_j": round(j_metrics["PPV"], 6),
+        "NPV_youden_j": round(j_metrics["NPV"], 6),
+    }
+
+
+def _write_fold_summary_csv(rows: List[Dict], out_csv: Path) -> None:
+    fieldnames = ["geometry", "fold_index", "test_set", "n_real", "n_fake", *SUMMARY_METRIC_KEYS]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _aggregate_fold_rows(fold_rows: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+    for row in fold_rows:
+        grouped[row["test_set"]].append(row)
+
+    mean_std_rows: List[Dict] = []
+    stats_rows: List[Dict] = []
+    for test_name in TEST_SET_ORDER:
+        rows = grouped.get(test_name, [])
+        if not rows:
+            continue
+
+        mean_std_row = {
+            "geometry": "winclip_official",
+            "test_set": test_name,
+            "n_folds": len(rows),
+            "n_real": int(rows[0]["n_real"]),
+            "n_fake": int(rows[0]["n_fake"]),
+        }
+        stats_row = {
+            "geometry": "winclip_official",
+            "test_set": test_name,
+            "n_folds": len(rows),
+            "n_real": int(rows[0]["n_real"]),
+            "n_fake": int(rows[0]["n_fake"]),
+        }
+
+        for key in SUMMARY_METRIC_KEYS:
+            vals = np.array([float(r[key]) for r in rows], dtype=np.float64)
+            mean_val = float(np.mean(vals))
+            std_val = float(np.std(vals))
+            mean_std_row[key] = f"{mean_val:.6f} ± {std_val:.6f}"
+            stats_row[f"{key}_mean"] = round(mean_val, 6)
+            stats_row[f"{key}_std"] = round(std_val, 6)
+
+        mean_std_rows.append(mean_std_row)
+        stats_rows.append(stats_row)
+
+    return mean_std_rows, stats_rows
+
+
+def _write_threshold_metrics_csv(test_dir: Path, threshold_rows: List[Dict]) -> None:
+    fieldnames = [
+        "threshold_name",
+        "threshold_value",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "sensitivity",
+        "specificity",
+        "PPV",
+        "NPV",
+        "auroc",
+        "auprc",
+    ]
+    with (test_dir / "threshold_metrics.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(threshold_rows)
+
+
+def _write_mean_std_summary_csv(rows: List[Dict], out_csv: Path) -> None:
+    fieldnames = ["geometry", "test_set", "n_folds", "n_real", "n_fake", *SUMMARY_METRIC_KEYS]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_stats_summary_csv(rows: List[Dict], out_csv: Path) -> None:
+    metric_fields: List[str] = []
+    for key in SUMMARY_METRIC_KEYS:
+        metric_fields.extend([f"{key}_mean", f"{key}_std"])
+    fieldnames = ["geometry", "test_set", "n_folds", "n_real", "n_fake", *metric_fields]
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _resolve_source_image(dataset_root: Path, rel_path: str) -> Path:
@@ -169,14 +416,14 @@ def run_official_winclip(
 
     run_dir = output_root / "winclip_official"
     run_dir.mkdir(parents=True, exist_ok=True)
-    summary_rows: List[Dict] = []
+    fold_summary_rows: List[Dict] = []
 
     for fold in manifest["cv_folds"]:
         fold_index = int(fold["fold_index"])
         fold_dir = run_dir / f"fold_{fold_index}"
         fold_dir.mkdir(parents=True, exist_ok=True)
 
-        for test_name in ["test_allfake", "test_gan", "test_ldm", "test_mls"]:
+        for test_name in TEST_SET_ORDER:
             test_spec = manifest["test_sets"][test_name]
             rel_paths = sorted(test_spec["real_ids"] + test_spec["fake_ids"])
 
@@ -209,8 +456,39 @@ def run_official_winclip(
                 finally:
                     os.chdir(cwd_before)
 
+            labels, scores = _to_numpy_labels_scores(gt_list, score_list)
+            thresholds = _calibrate_thresholds(labels, scores, default_threshold=DEFAULT_SCORE_THRESHOLD)
+            threshold_results: Dict[str, Dict] = {}
+            threshold_metrics_rows: List[Dict] = []
+            for threshold_name in ["default", "f1", "youden_j"]:
+                threshold = float(thresholds[threshold_name])
+                metrics = _compute_metrics(labels, scores, threshold)
+                threshold_results[threshold_name] = metrics
+                threshold_metrics_rows.append(
+                    {
+                        "threshold_name": threshold_name,
+                        "threshold_value": threshold,
+                        "accuracy": metrics["accuracy"],
+                        "precision": metrics["precision"],
+                        "recall": metrics["recall"],
+                        "f1": metrics["f1"],
+                        "sensitivity": metrics["sensitivity"],
+                        "specificity": metrics["specificity"],
+                        "PPV": metrics["PPV"],
+                        "NPV": metrics["NPV"],
+                        "auroc": metrics["auroc"],
+                        "auprc": metrics["auprc"],
+                    }
+                )
+
             test_dir = fold_dir / test_name
             test_dir.mkdir(parents=True, exist_ok=True)
+            _write_threshold_metrics_csv(test_dir, threshold_metrics_rows)
+            for threshold_name in ["default", "f1", "youden_j"]:
+                with (test_dir / f"classification_report_{threshold_name}.json").open("w", encoding="utf-8") as f:
+                    json.dump(threshold_results[threshold_name]["classification_report"], f, indent=2)
+
+            default_metrics = threshold_results["default"]
             with (test_dir / "results.json").open("w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -218,9 +496,14 @@ def run_official_winclip(
                         "test_set": test_name,
                         "n_real": test_spec["n_real"],
                         "n_fake": test_spec["n_fake"],
-                        "auroc": float(auroc),
-                        "auprc": float(aupr),
-                        "f1_max": float(f1_max),
+                        "auroc": float(default_metrics["auroc"]),
+                        "auprc": float(default_metrics["auprc"]),
+                        "f1_max": float(default_metrics["f1"]),
+                        "legacy_module_auroc": float(auroc),
+                        "legacy_module_auprc": float(aupr),
+                        "legacy_module_f1_max": float(f1_max),
+                        "thresholds": thresholds,
+                        "threshold_results": threshold_results,
                         "official_repo": "mala-lab/WinCLIP",
                         "checkpoint": checkpoint.as_posix(),
                         "shot": int(shot),
@@ -230,62 +513,30 @@ def run_official_winclip(
                     indent=2,
                 )
 
-            summary_rows.append(
-                {
-                    "geometry": "winclip_official",
-                    "test_set": test_name,
-                    "n_real": test_spec["n_real"],
-                    "n_fake": test_spec["n_fake"],
-                    "auroc": round(float(auroc), 6),
-                    "auprc": round(float(aupr), 6),
-                    "accuracy_default": "",
-                    "f1_default": round(float(f1_max), 6),
-                    "sensitivity_default": "",
-                    "specificity_default": "",
-                    "accuracy_f1": "",
-                    "f1_f1": "",
-                    "sensitivity_f1": "",
-                    "specificity_f1": "",
-                    "accuracy_youden_j": "",
-                    "f1_youden_j": "",
-                    "sensitivity_youden_j": "",
-                    "specificity_youden_j": "",
-                }
+            fold_summary_rows.append(_build_fold_summary_row(fold_index, test_name, test_spec, threshold_results))
+
+            print(
+                f"[WinCLIP] fold={fold_index} set={test_name} "
+                f"auroc={default_metrics['auroc']:.4f} auprc={default_metrics['auprc']:.4f} "
+                f"f1@default={default_metrics['f1']:.4f}",
+                flush=True,
             )
 
-    with (run_dir / "final_8run_summary.csv").open("w", newline="", encoding="utf-8") as f:
-        import csv
-
-        fieldnames = [
-            "geometry",
-            "test_set",
-            "n_real",
-            "n_fake",
-            "auroc",
-            "auprc",
-            "accuracy_default",
-            "f1_default",
-            "sensitivity_default",
-            "specificity_default",
-            "accuracy_f1",
-            "f1_f1",
-            "sensitivity_f1",
-            "specificity_f1",
-            "accuracy_youden_j",
-            "f1_youden_j",
-            "sensitivity_youden_j",
-            "specificity_youden_j",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(summary_rows)
+    _write_fold_summary_csv(fold_summary_rows, run_dir / "final_8run_summary_per_fold.csv")
+    mean_std_rows, stats_rows = _aggregate_fold_rows(fold_summary_rows)
+    _write_mean_std_summary_csv(mean_std_rows, run_dir / "final_8run_summary.csv")
+    _write_stats_summary_csv(stats_rows, run_dir / "final_8run_summary_stats.csv")
 
     with (run_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
                 "official_repo": "mala-lab/WinCLIP",
                 "shot": int(shot),
-                "summary_rows": summary_rows,
+                "default_threshold": DEFAULT_SCORE_THRESHOLD,
+                "n_folds": len(manifest.get("cv_folds", [])),
+                "summary_rows_per_fold": fold_summary_rows,
+                "summary_rows_mean_std": mean_std_rows,
+                "summary_rows_stats": stats_rows,
             },
             f,
             indent=2,
