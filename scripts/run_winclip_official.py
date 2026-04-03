@@ -432,12 +432,24 @@ def run_official_winclip(
         # default -> val_ids real scores percentile; f1/youden_j -> val_eval_ids.
         val_real_rel_paths = sorted(list(fold["val_ids"]))
         val_eval_rel_paths = sorted(list(fold["val_eval_ids"]))
+        val_eval_fake_rel_paths = [
+            rel for rel in val_eval_rel_paths if "/Real/" not in rel.replace("\\", "/")
+        ]
+        if len(val_eval_fake_rel_paths) == 0:
+            raise RuntimeError(
+                f"Fold {fold_index} has no fake samples in val_eval_ids; cannot calibrate f1/youden_j thresholds"
+            )
+
+        # Upstream WinCLIP computes AUROC/AUPR inside module.run and crashes on one-class labels.
+        # Inject one fake only for compatibility, then compute default threshold from real val_ids scores.
+        val_real_eval_paths = list(val_real_rel_paths)
+        val_real_eval_paths.append(val_eval_fake_rel_paths[0])
 
         with tempfile.TemporaryDirectory(prefix=f"winclip_{fold_index}_val_real_") as tmp_dir:
             temp_root = Path(tmp_dir) / "dataset"
             _build_mvtec_like_dataset(
                 dataset_root,
-                val_real_rel_paths,
+                val_real_eval_paths,
                 object_name,
                 temp_root,
                 create_train=(shot > 0),
