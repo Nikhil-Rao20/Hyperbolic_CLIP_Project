@@ -118,6 +118,72 @@ def _load_simplenet_modules():
     return backbones, simplenet_module, utils_module
 
 
+def _install_simplenet_nan_guards(simplenet_module) -> None:
+    if getattr(simplenet_module.SimpleNet, "_hyperclip_nan_guarded", False):
+        return
+
+    metrics_module = simplenet_module.metrics
+
+    def _safe_evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt):
+        _ = test_data
+        _ = features
+
+        score_vals = np.asarray(scores, dtype=np.float64).reshape(-1)
+        label_vals = np.asarray(labels_gt, dtype=np.int64).reshape(-1)
+        if score_vals.shape[0] != label_vals.shape[0]:
+            n = min(score_vals.shape[0], label_vals.shape[0])
+            score_vals = score_vals[:n]
+            label_vals = label_vals[:n]
+        if score_vals.size == 0:
+            return 0.5, -1.0, -1.0
+
+        finite_mask = np.isfinite(score_vals)
+        if not np.all(finite_mask):
+            fill = float(np.median(score_vals[finite_mask])) if np.any(finite_mask) else 0.0
+            score_vals = np.nan_to_num(score_vals, nan=fill, posinf=fill, neginf=fill)
+
+        s_min = float(np.min(score_vals))
+        s_max = float(np.max(score_vals))
+        s_den = max(s_max - s_min, 1e-12)
+        score_vals = (score_vals - s_min) / s_den
+
+        try:
+            auroc = float(metrics_module.compute_imagewise_retrieval_metrics(score_vals, label_vals)["auroc"])
+        except Exception:
+            auroc = 0.5
+
+        if len(masks_gt) > 0:
+            seg = np.asarray(segmentations, dtype=np.float64)
+            if seg.size == 0:
+                return auroc, -1.0, -1.0
+
+            flat = seg.reshape(len(seg), -1)
+            seg_min = flat.min(axis=1).reshape(-1, 1, 1, 1)
+            seg_max = flat.max(axis=1).reshape(-1, 1, 1, 1)
+            seg_den = np.maximum(seg_max - seg_min, 1e-12)
+            norm_segmentations = (seg - seg_min) / seg_den
+            norm_segmentations = np.nan_to_num(norm_segmentations, nan=0.0, posinf=1.0, neginf=0.0)
+
+            try:
+                pixel_scores = metrics_module.compute_pixelwise_retrieval_metrics(norm_segmentations, masks_gt)
+                full_pixel_auroc = float(pixel_scores.get("auroc", -1.0))
+            except Exception:
+                full_pixel_auroc = -1.0
+
+            try:
+                pro = float(metrics_module.compute_pro(np.squeeze(np.array(masks_gt)), norm_segmentations))
+            except Exception:
+                pro = -1.0
+        else:
+            full_pixel_auroc = -1.0
+            pro = -1.0
+
+        return auroc, full_pixel_auroc, pro
+
+    simplenet_module.SimpleNet._evaluate = _safe_evaluate
+    simplenet_module.SimpleNet._hyperclip_nan_guarded = True
+
+
 def _label_from_rel_path(rel_path: str) -> int:
     normalized = rel_path.replace("\\", "/")
     parts_lower = [part.lower() for part in Path(normalized).parts]
@@ -524,6 +590,7 @@ def run_official_simplenet(
         raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
 
     backbones, simplenet_module, simplenet_utils = _load_simplenet_modules()
+    _install_simplenet_nan_guards(simplenet_module)
 
     run_dir = output_root / "simplenet_official"
     run_dir.mkdir(parents=True, exist_ok=True)
