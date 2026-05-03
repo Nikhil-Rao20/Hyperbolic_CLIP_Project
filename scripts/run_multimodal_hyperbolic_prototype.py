@@ -1433,7 +1433,7 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
 
     for fold_summary in fold_summaries:
         fold_index = fold_summary["fold_index"]
-        fold_model, fold_processor, fold_projection_head, fold_center, fold_thresholds = load_best_model(
+        fold_model, fold_processor, fold_projection_head, fold_p_real, fold_p_fake, fold_thresholds = load_best_model(
             cfg,
             geometry,
             Path(fold_summary["checkpoint_path"]),
@@ -1450,7 +1450,8 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
                 fold_model,
                 fold_processor,
                 fold_projection_head,
-                fold_center,
+                fold_p_real,
+                fold_p_fake,
                 dataset,
                 batch_size,
                 device,
