@@ -19,7 +19,7 @@ target_per_generator: 104
 # ============================================================
 prompt_file: configs/prompts/prompts_converted.json
 
-warmup_epochs: 5
+warmup_epochs: 2
 lambda_align: 0.5
 lambda_reg: 0.1
 margin: 0.5
@@ -53,7 +53,7 @@ backbone_registry:
 # Training hyperparameters
 # ============================================================
 batch_size: 32
-epochs: 30
+epochs: 10
 num_workers: 0
 projection_dim: 256
 threshold_percentile: 95
