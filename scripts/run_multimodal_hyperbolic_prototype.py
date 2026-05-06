@@ -334,6 +334,22 @@ def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
     return 512
 
 
+def _get_clip_text_feature_dim(clip_model, backbone_type: str) -> int:
+    text_model = clip_model
+    if backbone_type == "dinov2" and hasattr(clip_model, "text_model"):
+        text_model = clip_model.text_model
+
+    dim = getattr(getattr(text_model, "config", None), "projection_dim", None)
+    if isinstance(dim, int) and dim > 0:
+        return dim
+
+    out_features = getattr(getattr(text_model, "text_projection", None), "out_features", None)
+    if isinstance(out_features, int) and out_features > 0:
+        return out_features
+
+    return 512
+
+
 def _rel_path_to_label_source(rel_path: str) -> Tuple[int, str]:
     path = Path(rel_path)
     parts_lower = [p.lower() for p in path.parts]
@@ -497,6 +513,68 @@ class HyperbolicProjectionHead(nn.Module):
         z_e = self.net(x)
         z_e = nn.functional.normalize(z_e, dim=-1) * self.scale.abs()
         return self.ball.expmap0(z_e)
+
+
+class SharedProjectionHead(nn.Module):
+    def __init__(
+        self,
+        image_input_dim: int,
+        text_input_dim: int,
+        projection_dim: int,
+        geometry: str,
+        curvature: float,
+        scale: float,
+    ):
+        super().__init__()
+        self.geometry = geometry
+        self.image_net = nn.Sequential(
+            nn.Linear(image_input_dim, image_input_dim),
+            nn.ReLU(),
+            nn.Linear(image_input_dim, projection_dim),
+        )
+        self.text_net = nn.Sequential(
+            nn.Linear(text_input_dim, text_input_dim),
+            nn.ReLU(),
+            nn.Linear(text_input_dim, projection_dim),
+        )
+        for module in list(self.image_net) + list(self.text_net):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        if geometry == "hyperbolic":
+            self.ball = geoopt.PoincareBall(c=curvature)
+            self.curvature = curvature
+            self.scale = nn.Parameter(torch.tensor(float(scale)))
+        else:
+            self.ball = None
+            self.curvature = None
+            self.scale = None
+
+    def _project(self, net: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        z = net(x)
+        if self.geometry == "hyperbolic":
+            z = nn.functional.normalize(z, dim=-1) * self.scale.abs()
+            return self.ball.expmap0(z)
+        return z
+
+    def project_image(self, x: torch.Tensor) -> torch.Tensor:
+        return self._project(self.image_net, x)
+
+    def project_text(self, x: torch.Tensor) -> torch.Tensor:
+        return self._project(self.text_net, x)
+
+
+def _project_image(projection_head, x: torch.Tensor) -> torch.Tensor:
+    if hasattr(projection_head, "project_image"):
+        return projection_head.project_image(x)
+    return projection_head(x)
+
+
+def _project_text(projection_head, x: torch.Tensor) -> torch.Tensor:
+    if hasattr(projection_head, "project_text"):
+        return projection_head.project_text(x)
+    return projection_head(x)
 
 
 @torch.no_grad()
@@ -868,8 +946,8 @@ def compute_prototype_real(
         real_prompts = [dataset[i][1] for i in range(start, end)]
         feats_img = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
         feats_txt = encode_text_features(clip_model, processor, real_prompts, device, backbone_type)
-        image_embs.append(projection_head(feats_img).detach())
-        text_embs.append(projection_head(feats_txt).detach())
+        image_embs.append(_project_image(projection_head, feats_img).detach())
+        text_embs.append(_project_text(projection_head, feats_txt).detach())
 
     all_embs = torch.cat(image_embs + text_embs, dim=0)
     if geometry == "hyperbolic":
@@ -895,7 +973,7 @@ def compute_prototype_fake(
         end = min(start + batch_size, len(dataset))
         fake_prompts = [dataset[i][2] for i in range(start, end)]
         feats_txt = encode_text_features(clip_model, processor, fake_prompts, device, backbone_type)
-        text_embs.append(projection_head(feats_txt).detach())
+        text_embs.append(_project_text(projection_head, feats_txt).detach())
 
     all_embs = torch.cat(text_embs, dim=0)
     if geometry == "hyperbolic":
@@ -935,7 +1013,7 @@ def compute_prototype_fake_multi(
         end = min(start + batch_size, len(dataset))
         fake_prompts = [dataset[i][2] for i in range(start, end)]
         feats_txt = encode_text_features(clip_model, processor, fake_prompts, device, backbone_type)
-        text_embs.append(projection_head(feats_txt).detach())
+        text_embs.append(_project_text(projection_head, feats_txt).detach())
 
     all_embs = torch.cat(text_embs, dim=0)
     k = int(max(1, min(num_prototypes, all_embs.shape[0])))
@@ -992,7 +1070,7 @@ def compute_anomaly_scores_multimodal(
             rels.append(rel)
 
         feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
-        proj = projection_head(feats)
+        proj = _project_image(projection_head, feats)
 
         if geometry == "hyperbolic":
             dist_real = hyperbolic_distance(proj, p_real, projection_head.ball)
@@ -1061,9 +1139,9 @@ def train_one_epoch_multimodal(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             img_feats = _encode_image_features(clip_model, processor, images, device, backbone_type)
-            z_img = projection_head(img_feats)
+            z_img = _project_image(projection_head, img_feats)
             text_real_feats = encode_text_features(clip_model, processor, real_prompts, device, backbone_type)
-            z_text_real = projection_head(text_real_feats)
+            z_text_real = _project_text(projection_head, text_real_feats)
 
             if warmup_mode:
                 loss = compute_alignment_loss_only(z_img, z_text_real, geometry, ball_or_none)
@@ -1172,8 +1250,18 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
+    text_dim = _get_clip_text_feature_dim(clip_model, backbone_type)
 
-    if geometry == "euclidean":
+    if backbone_type == "dinov2":
+        projection_head = SharedProjectionHead(
+            image_input_dim=feature_dim,
+            text_input_dim=text_dim,
+            projection_dim=projection_dim,
+            geometry=geometry,
+            curvature=curvature,
+            scale=scale,
+        ).to(device)
+    elif geometry == "euclidean":
         projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
     else:
         projection_head = HyperbolicProjectionHead(
@@ -1516,8 +1604,18 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
+    text_dim = _get_clip_text_feature_dim(clip_model, backbone_type)
 
-    if geometry == "euclidean":
+    if backbone_type == "dinov2":
+        projection_head = SharedProjectionHead(
+            image_input_dim=feature_dim,
+            text_input_dim=text_dim,
+            projection_dim=projection_dim,
+            geometry=geometry,
+            curvature=curvature,
+            scale=scale,
+        ).to(device)
+    elif geometry == "euclidean":
         projection_head = EuclideanProjectionHead(input_dim=feature_dim, projection_dim=projection_dim).to(device)
     else:
         projection_head = HyperbolicProjectionHead(
