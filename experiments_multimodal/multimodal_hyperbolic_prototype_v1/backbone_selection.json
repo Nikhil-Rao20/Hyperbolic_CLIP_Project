@@ -1,0 +1,42 @@
+{
+  "default_backbone": "B16",
+  "requested_backbones": [],
+  "selected_backbones": [
+    "B16"
+  ],
+  "default_num_vit_layers": 12,
+  "requested_layers": [],
+  "selected_layers": [
+    12
+  ],
+  "available_backbones": {
+    "B16": {
+      "display_name": "Hyperbolic CLIP ViT B16",
+      "model_name": "openai/clip-vit-base-patch16",
+      "type": "clip",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    },
+    "B32": {
+      "display_name": "Hyperbolic CLIP ViT B32",
+      "model_name": "openai/clip-vit-base-patch32",
+      "type": "clip",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    },
+    "L14": {
+      "display_name": "Hyperbolic CLIP ViT L14 (Official Large)",
+      "model_name": "openai/clip-vit-large-patch14",
+      "type": "clip",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    },
+    "RN101": {
+      "display_name": "Hyperbolic CLIP ViT RN101",
+      "model_name": "RN101",
+      "type": "open_clip",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    }
+  }
+}

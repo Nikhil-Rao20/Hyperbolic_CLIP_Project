@@ -1,0 +1,27 @@
+{
+  "n_total_images": 5121,
+  "n_real_total": 1226,
+  "n_gan_total": 104,
+  "n_ldm_total": 2496,
+  "n_mls_total": 1295,
+  "n_real_subjects_total": 405,
+  "n_real_train_images": 500,
+  "n_real_test_pool_images": 726,
+  "n_real_train_subjects": 166,
+  "n_real_test_pool_subjects": 239,
+  "n_calibration_fake_pool_images": 3583,
+  "calibration_fake_pool_by_generator": {
+    "LDM": 2392,
+    "MLS": 1191
+  },
+  "mls_source_pool_counts": {
+    "MLS_CERMEP": 54,
+    "MLS_TCGA": 173,
+    "MLS_UPenn": 1068
+  },
+  "mls_source_sample_counts": {
+    "MLS_CERMEP": 4,
+    "MLS_TCGA": 14,
+    "MLS_UPenn": 86
+  }
+}
