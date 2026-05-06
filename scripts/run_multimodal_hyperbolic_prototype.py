@@ -7,10 +7,12 @@ import itertools
 import json
 import math
 import os
+import random
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -22,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -320,13 +322,21 @@ def collate_fn(batch):
 
 
 class MultimodalPromptDataset(Dataset):
-    def __init__(self, dataset_root: Path, rel_paths: Sequence[str], real_prompts: Sequence[str], fake_prompts: Sequence[str]):
+    def __init__(
+        self,
+        dataset_root: Path,
+        rel_paths: Sequence[str],
+        real_prompts: Sequence[str],
+        fake_prompts: Sequence[str],
+        image_augmentor=None,
+    ):
         if len(rel_paths) != len(real_prompts) or len(rel_paths) != len(fake_prompts):
             raise RuntimeError("Prompt counts must match rel_paths length.")
         self.dataset_root = dataset_root
         self.rel_paths = list(rel_paths)
         self.real_prompts = list(real_prompts)
         self.fake_prompts = list(fake_prompts)
+        self.image_augmentor = image_augmentor
 
     def __len__(self):
         return len(self.rel_paths)
@@ -335,8 +345,53 @@ class MultimodalPromptDataset(Dataset):
         rel = self.rel_paths[idx]
         abs_path = self.dataset_root / rel
         image = Image.open(abs_path).convert("RGB")
+        if self.image_augmentor is not None:
+            image = self.image_augmentor(image)
         label, source = _rel_path_to_label_source(rel)
         return image, self.real_prompts[idx], self.fake_prompts[idx], label, source, rel
+
+
+class GANLikeAugmentor:
+    def __init__(self, prob: float = 0.35, min_ops: int = 1, max_ops: int = 3):
+        self.prob = float(max(0.0, min(1.0, prob)))
+        self.min_ops = max(1, int(min_ops))
+        self.max_ops = max(self.min_ops, int(max_ops))
+
+    def _jpeg_recompress(self, image: Image.Image) -> Image.Image:
+        quality = random.randint(30, 85)
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+    def _resample_artifact(self, image: Image.Image) -> Image.Image:
+        w, h = image.size
+        scale = random.uniform(0.55, 0.85)
+        new_w, new_h = max(16, int(w * scale)), max(16, int(h * scale))
+        down = image.resize((new_w, new_h), Image.BILINEAR)
+        return down.resize((w, h), Image.BICUBIC)
+
+    def _blur_or_sharpen(self, image: Image.Image) -> Image.Image:
+        if random.random() < 0.5:
+            radius = random.uniform(0.5, 1.8)
+            return image.filter(ImageFilter.GaussianBlur(radius=radius))
+        factor = random.uniform(1.2, 2.2)
+        return ImageEnhance.Sharpness(image).enhance(factor)
+
+    def _tone_shift(self, image: Image.Image) -> Image.Image:
+        image = ImageEnhance.Contrast(image).enhance(random.uniform(0.85, 1.25))
+        image = ImageEnhance.Brightness(image).enhance(random.uniform(0.9, 1.15))
+        return image
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > self.prob:
+            return image
+
+        ops = [self._jpeg_recompress, self._resample_artifact, self._blur_or_sharpen, self._tone_shift]
+        n_ops = random.randint(self.min_ops, self.max_ops)
+        for op in random.sample(ops, k=min(n_ops, len(ops))):
+            image = op(image)
+        return image
 
 
 def multimodal_collate_fn(batch):
@@ -393,7 +448,8 @@ class HyperbolicProjectionHead(nn.Module):
 
 @torch.no_grad()
 def frechet_mean_iterative(points, curvature, max_iter=100, tol=1e-7):
-    ball = geoopt.PoincareBall(c=curvature)
+    c = torch.tensor(float(curvature), device=points.device, dtype=points.dtype)
+    ball = geoopt.PoincareBall(c=c)
     mean = points.mean(dim=0)
     mean_norm = mean.norm()
     max_norm = 1.0 / math.sqrt(curvature) - 1e-5
@@ -414,8 +470,38 @@ def frechet_mean_iterative(points, curvature, max_iter=100, tol=1e-7):
 
 
 def hyperbolic_distance(x, center, ball):
-    center_exp = center.unsqueeze(0)
-    return ball.dist(x, center_exp).view(-1)
+    if center.ndim == 1:
+        center_exp = center.unsqueeze(0)
+        return ball.dist(x, center_exp).view(-1)
+    if center.ndim == 2:
+        dists = [ball.dist(x, center[i].unsqueeze(0)).view(-1) for i in range(center.shape[0])]
+        return torch.stack(dists, dim=1)
+    raise RuntimeError(f"Invalid center ndim={center.ndim}; expected 1 or 2")
+
+
+def _kmeans_torch(points: torch.Tensor, k: int, n_iter: int = 12) -> torch.Tensor:
+    n = points.shape[0]
+    if k <= 1 or n <= 1:
+        return torch.zeros(n, dtype=torch.long, device=points.device)
+    k = min(k, n)
+
+    # deterministic init from evenly spaced indices under fixed global seed
+    init_idx = torch.linspace(0, n - 1, steps=k, device=points.device).long()
+    centroids = points[init_idx].clone()
+
+    assignments = torch.zeros(n, dtype=torch.long, device=points.device)
+    for _ in range(max(1, n_iter)):
+        d2 = torch.cdist(points, centroids, p=2)
+        assignments = torch.argmin(d2, dim=1)
+        new_centroids = []
+        for j in range(k):
+            mask = assignments == j
+            if mask.any():
+                new_centroids.append(points[mask].mean(dim=0))
+            else:
+                new_centroids.append(centroids[j])
+        centroids = torch.stack(new_centroids, dim=0)
+    return assignments
 
 
 def predict_from_threshold(scores: np.ndarray, threshold: float, fake_positive_if_high: bool = True):
@@ -628,6 +714,16 @@ def load_prompts(prompt_file_path: Path) -> Tuple[List[str], List[str]]:
     return list(real_prompts), list(fake_prompts)
 
 
+GAN_STYLE_FAKE_PROMPTS = [
+    "A synthetic brain MRI image with adversarially generated texture artifacts and unrealistic high-frequency patterns.",
+    "An AI-generated cranial MRI with subtle checkerboard upsampling artifacts and non-physiological edges.",
+    "A forged MRI scan showing over-smoothed tissue boundaries and inconsistent local contrast statistics.",
+    "A manipulated neuroimaging slice containing GAN-like texture repetition and spectral aliasing artifacts.",
+    "A synthetic head MRI with implausible anatomical micro-texture and interpolation-induced ringing.",
+    "An artificial MRI image with generation artifacts near cortical boundaries and abnormal fine-grain noise.",
+]
+
+
 def encode_text_features(clip_model, processor, texts: List[str], device: torch.device, backbone_type: str) -> torch.Tensor:
     with torch.no_grad():
         if backbone_type == "open_clip":
@@ -657,19 +753,30 @@ def multimodal_loss(
     lambda_align: float,
     lambda_reg: float,
     margin: float,
+    hard_negative_weight: float,
 ) -> torch.Tensor:
     if geometry == "hyperbolic":
         d_real = ball_or_none.dist(z_img, p_real.unsqueeze(0)).view(-1)
-        d_fake = ball_or_none.dist(z_img, p_fake.unsqueeze(0)).view(-1)
+        if p_fake.ndim == 1:
+            d_fake = ball_or_none.dist(z_img, p_fake.unsqueeze(0)).view(-1)
+        else:
+            d_fake_all = hyperbolic_distance(z_img, p_fake, ball_or_none)
+            d_fake = d_fake_all.min(dim=1).values
         l_align = ball_or_none.dist(z_img, z_text_real).mean()
         l_reg = (torch.norm(z_img, dim=-1) ** 2).mean() + (torch.norm(z_text_real, dim=-1) ** 2).mean()
     else:
         d_real = torch.norm(z_img - p_real.unsqueeze(0), dim=-1)
-        d_fake = torch.norm(z_img - p_fake.unsqueeze(0), dim=-1)
+        if p_fake.ndim == 1:
+            d_fake = torch.norm(z_img - p_fake.unsqueeze(0), dim=-1)
+        else:
+            d_fake = torch.norm(z_img.unsqueeze(1) - p_fake.unsqueeze(0), dim=-1).min(dim=1).values
         l_align = torch.norm(z_img - z_text_real, dim=-1).mean()
         l_reg = torch.tensor(0.0, device=z_img.device)
 
-    l_proto = d_real.mean() + F.relu(margin - d_fake).mean()
+    per_sample = d_real + F.relu(margin - d_fake)
+    hardness = torch.clamp(margin - (d_fake - d_real), min=0.0)
+    weights = 1.0 + float(max(0.0, hard_negative_weight)) * (hardness / (margin + 1e-8))
+    l_proto = (weights * per_sample).mean()
     return l_proto + lambda_align * l_align + lambda_reg * l_reg
 
 
@@ -694,8 +801,8 @@ def compute_prototype_real(
         real_prompts = [dataset[i][1] for i in range(start, end)]
         feats_img = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
         feats_txt = encode_text_features(clip_model, processor, real_prompts, device, backbone_type)
-        image_embs.append(projection_head(feats_img).cpu())
-        text_embs.append(projection_head(feats_txt).cpu())
+        image_embs.append(projection_head(feats_img).detach())
+        text_embs.append(projection_head(feats_txt).detach())
 
     all_embs = torch.cat(image_embs + text_embs, dim=0)
     if geometry == "hyperbolic":
@@ -721,12 +828,71 @@ def compute_prototype_fake(
         end = min(start + batch_size, len(dataset))
         fake_prompts = [dataset[i][2] for i in range(start, end)]
         feats_txt = encode_text_features(clip_model, processor, fake_prompts, device, backbone_type)
-        text_embs.append(projection_head(feats_txt).cpu())
+        text_embs.append(projection_head(feats_txt).detach())
 
     all_embs = torch.cat(text_embs, dim=0)
     if geometry == "hyperbolic":
         return frechet_mean_iterative(all_embs, projection_head.curvature)
     return all_embs.mean(dim=0)
+
+
+@torch.no_grad()
+def compute_prototype_fake_multi(
+    clip_model,
+    processor,
+    projection_head,
+    dataset: MultimodalPromptDataset,
+    batch_size,
+    device,
+    geometry: str,
+    backbone_type: str,
+    num_prototypes: int,
+) -> torch.Tensor:
+    base = compute_prototype_fake(
+        clip_model,
+        processor,
+        projection_head,
+        dataset,
+        batch_size,
+        device,
+        geometry,
+        backbone_type,
+    )
+    if int(num_prototypes) <= 1:
+        return base
+
+    clip_model.eval()
+    projection_head.eval()
+    text_embs = []
+    for start in range(0, len(dataset), batch_size):
+        end = min(start + batch_size, len(dataset))
+        fake_prompts = [dataset[i][2] for i in range(start, end)]
+        feats_txt = encode_text_features(clip_model, processor, fake_prompts, device, backbone_type)
+        text_embs.append(projection_head(feats_txt).detach())
+
+    all_embs = torch.cat(text_embs, dim=0)
+    k = int(max(1, min(num_prototypes, all_embs.shape[0])))
+    if k == 1:
+        return base
+
+    if geometry == "hyperbolic":
+        tangent = projection_head.ball.logmap0(all_embs)
+        assignments = _kmeans_torch(tangent, k)
+    else:
+        assignments = _kmeans_torch(all_embs, k)
+
+    clusters = []
+    for j in range(k):
+        pts = all_embs[assignments == j]
+        if pts.numel() == 0:
+            clusters.append(base)
+            continue
+        if geometry == "hyperbolic":
+            clusters.append(frechet_mean_iterative(pts, projection_head.curvature))
+        else:
+            clusters.append(pts.mean(dim=0))
+
+    return torch.stack(clusters, dim=0)
 
 
 @torch.no_grad()
@@ -763,10 +929,14 @@ def compute_anomaly_scores_multimodal(
 
         if geometry == "hyperbolic":
             dist_real = hyperbolic_distance(proj, p_real, projection_head.ball)
-            dist_fake = hyperbolic_distance(proj, p_fake, projection_head.ball)
+            dist_fake_all = hyperbolic_distance(proj, p_fake, projection_head.ball)
+            dist_fake = dist_fake_all.min(dim=1).values if dist_fake_all.ndim == 2 else dist_fake_all
         else:
             dist_real = torch.norm(proj - p_real.unsqueeze(0), dim=-1)
-            dist_fake = torch.norm(proj - p_fake.unsqueeze(0), dim=-1)
+            if p_fake.ndim == 1:
+                dist_fake = torch.norm(proj - p_fake.unsqueeze(0), dim=-1)
+            else:
+                dist_fake = torch.norm(proj.unsqueeze(1) - p_fake.unsqueeze(0), dim=-1).min(dim=1).values
 
         score = dist_real - dist_fake
         scores.extend(score.detach().cpu().numpy().tolist())
@@ -808,6 +978,7 @@ def train_one_epoch_multimodal(
     lambda_align: float,
     lambda_reg: float,
     margin: float,
+    hard_negative_weight: float,
     warmup_mode: bool,
 ):
     clip_model.train()
@@ -840,6 +1011,7 @@ def train_one_epoch_multimodal(
                     lambda_align,
                     lambda_reg,
                     margin,
+                    hard_negative_weight,
                 )
 
         scaler.scale(loss).backward()
@@ -910,6 +1082,12 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     lambda_align = float(cfg.get("lambda_align", 0.5))
     lambda_reg = float(cfg.get("lambda_reg", 0.1))
     margin = float(cfg.get("margin", 0.5))
+    hard_negative_weight = float(cfg.get("hard_negative_weight", 1.0))
+    fake_num_prototypes = int(cfg.get("fake_num_prototypes", 2))
+    enable_gan_prompt_enrichment = bool(cfg.get("enable_gan_prompt_enrichment", True))
+    gan_like_augment_prob = float(cfg.get("gan_like_augment_prob", 0.35))
+    fixed_fpr_targets = cfg.get("fixed_fpr_targets", [0.01, 0.05, 0.10])
+    fixed_fpr_targets = [float(v) for v in fixed_fpr_targets if 0.0 < float(v) < 1.0]
 
     set_global_determinism(seed)
 
@@ -937,11 +1115,20 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     if not prompt_path.is_absolute():
         prompt_path = PROJECT_ROOT / prompt_path
     real_prompts_pool, fake_prompts_pool = load_prompts(prompt_path)
+    if enable_gan_prompt_enrichment:
+        fake_prompts_pool = list(fake_prompts_pool) + GAN_STYLE_FAKE_PROMPTS
     n_train = len(fold["train_ids"])
     real_prompts_fold = list(itertools.islice(itertools.cycle(real_prompts_pool), n_train))
     fake_prompts_fold = list(itertools.islice(itertools.cycle(fake_prompts_pool), n_train))
 
-    train_ds = MultimodalPromptDataset(dataset_root, fold["train_ids"], real_prompts_fold, fake_prompts_fold)
+    train_augmentor = GANLikeAugmentor(prob=gan_like_augment_prob)
+    train_ds = MultimodalPromptDataset(
+        dataset_root,
+        fold["train_ids"],
+        real_prompts_fold,
+        fake_prompts_fold,
+        image_augmentor=train_augmentor,
+    )
     val_real_ds = ImagePathDataset(dataset_root, fold["val_ids"])
     val_eval_ds = ImagePathDataset(dataset_root, fold["val_eval_ids"])
 
@@ -982,7 +1169,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             geometry,
             backbone_type,
         )
-        p_fake = compute_prototype_fake(
+        p_fake = compute_prototype_fake_multi(
             clip_model,
             processor,
             projection_head,
@@ -991,6 +1178,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             device,
             geometry,
             backbone_type,
+            fake_num_prototypes,
         )
 
         warmup_mode = epoch <= warmup_epochs
@@ -1010,6 +1198,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             lambda_align,
             lambda_reg,
             margin,
+            hard_negative_weight,
             warmup_mode,
         )
 
@@ -1023,7 +1212,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             geometry,
             backbone_type,
         )
-        p_fake = compute_prototype_fake(
+        p_fake = compute_prototype_fake_multi(
             clip_model,
             processor,
             projection_head,
@@ -1032,6 +1221,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             device,
             geometry,
             backbone_type,
+            fake_num_prototypes,
         )
 
         if geometry == "hyperbolic":
@@ -1055,11 +1245,16 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
         default_threshold = max(float(np.percentile(val_in_scores, threshold_percentile)), 0.0)
         best_f1, best_j = calibrate_threshold(val_eval_labels, val_eval_scores)
-        val_metrics = {
-            "default": compute_metrics(val_eval_labels, val_eval_scores, default_threshold),
-            "f1": compute_metrics(val_eval_labels, val_eval_scores, best_f1["threshold"]),
-            "youden_j": compute_metrics(val_eval_labels, val_eval_scores, best_j["threshold"]),
+        threshold_map = {
+            "default": float(default_threshold),
+            "f1": float(best_f1["threshold"]),
+            "youden_j": float(best_j["threshold"]),
         }
+        for fpr in fixed_fpr_targets:
+            key = f"fpr_{int(round(fpr * 100.0))}"
+            threshold_map[key] = float(np.quantile(val_in_scores, 1.0 - fpr))
+
+        val_metrics = {name: compute_metrics(val_eval_labels, val_eval_scores, th) for name, th in threshold_map.items()}
 
         auroc = val_metrics["f1"]["auroc"]
         improved = auroc > best_auroc
@@ -1073,6 +1268,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 "default_threshold": default_threshold,
                 "calibrated_threshold_f1": best_f1["threshold"],
                 "calibrated_threshold_youden_j": best_j["threshold"],
+                "thresholds": threshold_map,
                 "geometry": geometry,
                 "fold_index": fold["fold_index"],
                 "val_metrics": val_metrics,
@@ -1084,6 +1280,9 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 "f1": float(best_f1["threshold"]),
                 "youden_j": float(best_j["threshold"]),
             }
+            for k, v in threshold_map.items():
+                if k not in best_val_thresholds:
+                    best_val_thresholds[k] = float(v)
             torch.save(best_payload, fold_dir / "best_model.pth")
 
         log_rows.append(
@@ -1129,7 +1328,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
     # Save fold-level validation interpretation artifacts for all thresholds.
     val_threshold_rows = []
-    for threshold_name in ["default", "f1", "youden_j"]:
+    for threshold_name in best_val_thresholds.keys():
         th = best_val_thresholds[threshold_name]
         preds = predict_from_threshold(best_val_scores, th)
         cm_title = f"Val CM - {geometry} fold {fold['fold_index']} ({threshold_name})"
@@ -1199,6 +1398,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 "default_threshold": best_payload["default_threshold"],
                 "calibrated_threshold_f1": best_payload["calibrated_threshold_f1"],
                 "calibrated_threshold_youden_j": best_payload["calibrated_threshold_youden_j"],
+                "thresholds": best_val_thresholds,
                 "val_metrics": best_payload["val_metrics"],
             },
             f,
@@ -1249,15 +1449,32 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     projection_head.load_state_dict(ckpt["projection_head"])
     p_real = ckpt["p_real"].to(device)
     p_fake = ckpt["p_fake"].to(device)
-    thresholds = {
-        "f1": float(ckpt["calibrated_threshold_f1"]),
-        "youden_j": float(ckpt["calibrated_threshold_youden_j"]),
-        "default": float(ckpt["default_threshold"]),
-    }
+    if "thresholds" in ckpt and isinstance(ckpt["thresholds"], dict):
+        thresholds = {str(k): float(v) for k, v in ckpt["thresholds"].items()}
+    else:
+        thresholds = {
+            "f1": float(ckpt["calibrated_threshold_f1"]),
+            "youden_j": float(ckpt["calibrated_threshold_youden_j"]),
+            "default": float(ckpt["default_threshold"]),
+        }
     return clip_model, processor, projection_head, p_real, p_fake, thresholds
 
 
 def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, geometry_dir: Path) -> Dict:
+    def _threshold_order_key(name: str):
+        if name == "default":
+            return (0, 0.0)
+        if name == "f1":
+            return (1, 0.0)
+        if name == "youden_j":
+            return (2, 0.0)
+        if name.startswith("fpr_"):
+            try:
+                return (3, float(name.split("_", 1)[1]))
+            except Exception:
+                return (4, name)
+        return (5, name)
+
     fold_summaries = []
     for fold in manifest["cv_folds"]:
         fold_dir = geometry_dir / f"fold_{fold['fold_index']}"
@@ -1316,7 +1533,7 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         }
 
         threshold_metrics_rows = []
-        for threshold_name in ["default", "f1", "youden_j"]:
+        for threshold_name in sorted(thresholds.keys(), key=_threshold_order_key):
             m = result["threshold_results"][threshold_name]
             threshold_metrics_rows.append(
                 {
