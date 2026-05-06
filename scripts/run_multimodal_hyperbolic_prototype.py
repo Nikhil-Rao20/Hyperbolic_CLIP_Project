@@ -74,6 +74,10 @@ def _resolve_backbone_registry(cfg: dict) -> Tuple[Dict[str, Dict], str]:
             "display_name": spec.get("display_name", norm_key),
             "model_name": model_name,
             "type": spec.get("type", "clip"),
+            "text_model_name": spec.get(
+                "text_model_name",
+                cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16")),
+            ),
             "open_clip_pretrained": spec.get("open_clip_pretrained", "openai"),
             "vision_encoder_mode": spec.get(
                 "vision_encoder_mode",
@@ -144,13 +148,16 @@ def _default_num_vit_layers(cfg: dict) -> int:
 
 def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
     cfg = copy.deepcopy(base_cfg)
-    cfg["clip_model_name"] = backbone_spec["model_name"]
     backbone_cfg = dict(cfg.get("backbone", {}))
     backbone_cfg["model_name"] = backbone_spec["model_name"]
     backbone_cfg["type"] = backbone_spec.get("type", "clip")
     backbone_cfg["open_clip_pretrained"] = backbone_spec.get("open_clip_pretrained", "openai")
     backbone_cfg["vision_encoder_mode"] = backbone_spec.get("vision_encoder_mode", backbone_cfg.get("vision_encoder_mode", "fine_tune"))
     cfg["backbone"] = backbone_cfg
+    if backbone_cfg["type"] == "dinov2":
+        cfg["clip_text_model_name"] = backbone_spec.get("text_model_name", cfg.get("clip_model_name"))
+    else:
+        cfg["clip_model_name"] = backbone_spec["model_name"]
     return cfg
 
 
@@ -210,23 +217,44 @@ def _truncate_clip_vision_layers(clip_model: CLIPModel, num_vit_layers: int) -> 
         clip_model.vision_model.config.num_hidden_layers = num_vit_layers
 
 
+class DinoWithClipText(nn.Module):
+    def __init__(self, image_model: nn.Module, text_model: CLIPModel):
+        super().__init__()
+        self.image_model = image_model
+        self.text_model = text_model
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.image_model(pixel_values)
+
+    def get_text_features(self, **inputs) -> torch.Tensor:
+        return self.text_model.get_text_features(**inputs)
+
+
 def _load_image_backbone(
     backbone_name: str,
     backbone_type: str,
     open_clip_pretrained: str,
     device: torch.device,
     num_vit_layers: int | None = None,
+    text_model_name: str | None = None,
 ):
     if backbone_type == "dinov2":
+        if not text_model_name:
+            raise RuntimeError("DINOv2 backbone requires clip_text_model_name for text encoding.")
         import torchvision.transforms as transforms
-        model = torch.hub.load("facebookresearch/dinov2", backbone_name).to(device)
+        image_model = torch.hub.load("facebookresearch/dinov2", backbone_name).to(device)
+        text_model = CLIPModel.from_pretrained(text_model_name, use_safetensors=True).to(device)
         preprocess = transforms.Compose([
             transforms.Resize((518, 518)),
             transforms.CenterCrop(518),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        return model, preprocess
+        processor = {
+            "image": preprocess,
+            "text": CLIPProcessor.from_pretrained(text_model_name),
+        }
+        return DinoWithClipText(image_model, text_model), processor
 
     if backbone_type == "open_clip":
         if open_clip is None:
@@ -262,7 +290,8 @@ def _load_image_backbone(
 
 def _encode_image_features(clip_model, processor, images, device: torch.device, backbone_type: str) -> torch.Tensor:
     if backbone_type == "dinov2":
-        pixel_values = torch.stack([processor(img) for img in images], dim=0).to(device)
+        image_processor = processor["image"] if isinstance(processor, dict) else processor
+        pixel_values = torch.stack([image_processor(img) for img in images], dim=0).to(device)
         with torch.no_grad():
             feats = clip_model(pixel_values)
         return feats
@@ -279,7 +308,10 @@ def _encode_image_features(clip_model, processor, images, device: torch.device, 
 def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
     # CLIP backbones can expose different image feature dimensions (e.g., B32=512, L14=768, RN101=512).
     if backbone_type == "dinov2":
-        # DINOv2 models all output 768-dim features
+        image_model = getattr(clip_model, "image_model", clip_model)
+        dim = getattr(image_model, "embed_dim", None)
+        if isinstance(dim, int) and dim > 0:
+            return dim
         return 768
 
     if backbone_type == "open_clip":
@@ -703,6 +735,14 @@ def write_summary_csv(rows: List[Dict], out_csv: Path) -> None:
 def configure_clip_trainability(clip_model, vision_mode: str, backbone_type: str):
     train_vision = vision_mode != "frozen"
 
+    if backbone_type == "dinov2":
+        for p in clip_model.parameters():
+            p.requires_grad = False
+        if hasattr(clip_model, "image_model"):
+            for p in clip_model.image_model.parameters():
+                p.requires_grad = train_vision
+        return
+
     if backbone_type == "open_clip":
         for p in clip_model.parameters():
             p.requires_grad = False
@@ -747,6 +787,12 @@ GAN_STYLE_FAKE_PROMPTS = [
 
 def encode_text_features(clip_model, processor, texts: List[str], device: torch.device, backbone_type: str) -> torch.Tensor:
     with torch.no_grad():
+        if backbone_type == "dinov2":
+            text_processor = processor["text"] if isinstance(processor, dict) else processor
+            inputs = text_processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            feats = clip_model.get_text_features(**inputs)
+            return _to_tensor(feats)
         if backbone_type == "open_clip":
             tokens = open_clip.tokenize(texts).to(device)
             feats = clip_model.encode_text(tokens)
@@ -1083,6 +1129,7 @@ def evaluate_test_set(clip_model, processor, projection_head, p_real, p_fake, da
 def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir: Path) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
+    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
     backbone_type = cfg.get("backbone", {}).get("type", "clip")
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     batch_size = int(cfg.get("batch_size", 32))
@@ -1118,6 +1165,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         open_clip_pretrained,
         device,
         num_vit_layers=num_vit_layers,
+        text_model_name=text_model_name,
     )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
@@ -1443,6 +1491,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
 def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: torch.device):
     clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
+    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
     backbone_type = cfg.get("backbone", {}).get("type", "clip")
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     projection_dim = int(cfg.get("projection_dim", 256))
@@ -1457,6 +1506,7 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
         open_clip_pretrained,
         device,
         num_vit_layers=num_vit_layers,
+        text_model_name=text_model_name,
     )
     configure_clip_trainability(clip_model, vision_mode, backbone_type)
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)

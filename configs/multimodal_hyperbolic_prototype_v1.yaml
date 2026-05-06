@@ -59,11 +59,13 @@ backbone_registry:
     display_name: DINOv2 ViT-Base (Self-Supervised)
     type: dinov2
     model_name: dinov2_vits14
+    text_model_name: openai/clip-vit-base-patch16
     vision_encoder_mode: fine_tune
   DINO_V2_L:
     display_name: DINOv2 ViT-Large (Self-Supervised)
     type: dinov2
     model_name: dinov2_vitl14
+    text_model_name: openai/clip-vit-base-patch16
     vision_encoder_mode: fine_tune
 
 # ============================================================
