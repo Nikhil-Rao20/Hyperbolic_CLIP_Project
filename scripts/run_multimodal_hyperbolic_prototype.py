@@ -1228,9 +1228,15 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             # ensure prototypes are on the same device as the projection head/ball
             p_real_dev = p_real.to(device) if p_real.device != device else p_real
             p_fake_dev = p_fake.to(device) if p_fake.device != device else p_fake
-            sep = float(hyperbolic_distance(p_real_dev.unsqueeze(0), p_fake_dev, projection_head.ball)[0].item())
+            dist_all = hyperbolic_distance(p_real_dev.unsqueeze(0), p_fake_dev, projection_head.ball)
+            sep = float(dist_all.min().item() if dist_all.ndim > 1 else dist_all[0].item())
         else:
-            sep = float(torch.norm(p_real.to(device) - p_fake.to(device)).item())
+            p_real_dev = p_real.to(device)
+            p_fake_dev = p_fake.to(device)
+            if p_fake_dev.ndim == 1:
+                sep = float(torch.norm(p_real_dev - p_fake_dev).item())
+            else:
+                sep = float(torch.norm(p_real_dev.unsqueeze(0) - p_fake_dev, dim=-1).min().item())
         prototype_distance_epochs.append(epoch)
         prototype_distance_values.append(sep)
 
