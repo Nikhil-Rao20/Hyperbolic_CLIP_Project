@@ -16,6 +16,7 @@
       "display_name": "Hyperbolic CLIP ViT B16",
       "model_name": "openai/clip-vit-base-patch16",
       "type": "clip",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     },
@@ -23,6 +24,7 @@
       "display_name": "Hyperbolic CLIP ViT B32",
       "model_name": "openai/clip-vit-base-patch32",
       "type": "clip",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     },
@@ -30,6 +32,7 @@
       "display_name": "Hyperbolic CLIP ViT L14 (Official Large)",
       "model_name": "openai/clip-vit-large-patch14",
       "type": "clip",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     },
@@ -37,6 +40,7 @@
       "display_name": "Hyperbolic CLIP ViT RN101",
       "model_name": "RN101",
       "type": "open_clip",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     },
@@ -44,6 +48,7 @@
       "display_name": "DINOv2 ViT-Base (Self-Supervised)",
       "model_name": "dinov2_vits14",
       "type": "dinov2",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     },
@@ -51,6 +56,7 @@
       "display_name": "DINOv2 ViT-Large (Self-Supervised)",
       "model_name": "dinov2_vitl14",
       "type": "dinov2",
+      "text_model_name": "openai/clip-vit-base-patch16",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     }

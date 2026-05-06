@@ -1128,9 +1128,12 @@ def evaluate_test_set(clip_model, processor, projection_head, p_real, p_fake, da
 
 def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir: Path) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
-    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
     backbone_type = cfg.get("backbone", {}).get("type", "clip")
+    backbone_model_name = cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16")
+    clip_model_name = cfg.get("clip_model_name", backbone_model_name)
+    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
+    if backbone_type == "dinov2":
+        clip_model_name = backbone_model_name
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     batch_size = int(cfg.get("batch_size", 32))
     epochs = int(cfg.get("epochs", 10))
@@ -1490,9 +1493,12 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
 
 def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: torch.device):
-    clip_model_name = cfg.get("clip_model_name", cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16"))
-    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
     backbone_type = cfg.get("backbone", {}).get("type", "clip")
+    backbone_model_name = cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16")
+    clip_model_name = cfg.get("clip_model_name", backbone_model_name)
+    text_model_name = cfg.get("clip_text_model_name", clip_model_name)
+    if backbone_type == "dinov2":
+        clip_model_name = backbone_model_name
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     projection_dim = int(cfg.get("projection_dim", 256))
     curvature = float(cfg.get("curvature", 1.0))
