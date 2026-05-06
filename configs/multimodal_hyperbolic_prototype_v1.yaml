@@ -55,6 +55,16 @@ backbone_registry:
     model_name: RN101
     open_clip_pretrained: openai
     vision_encoder_mode: fine_tune
+  DINO_V2:
+    display_name: DINOv2 ViT-Base (Self-Supervised)
+    type: dinov2
+    model_name: dinov2_vits14
+    vision_encoder_mode: fine_tune
+  DINO_V2_L:
+    display_name: DINOv2 ViT-Large (Self-Supervised)
+    type: dinov2
+    model_name: dinov2_vitl14
+    vision_encoder_mode: fine_tune
 
 # ============================================================
 # Training hyperparameters

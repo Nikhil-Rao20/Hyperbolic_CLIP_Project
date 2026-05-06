@@ -217,6 +217,17 @@ def _load_image_backbone(
     device: torch.device,
     num_vit_layers: int | None = None,
 ):
+    if backbone_type == "dinov2":
+        import torchvision.transforms as transforms
+        model = torch.hub.load("facebookresearch/dinov2", backbone_name).to(device)
+        preprocess = transforms.Compose([
+            transforms.Resize((518, 518)),
+            transforms.CenterCrop(518),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        return model, preprocess
+
     if backbone_type == "open_clip":
         if open_clip is None:
             raise ImportError("open_clip_torch is required for open_clip backbones. Install with: pip install open_clip_torch")
@@ -250,6 +261,12 @@ def _load_image_backbone(
 
 
 def _encode_image_features(clip_model, processor, images, device: torch.device, backbone_type: str) -> torch.Tensor:
+    if backbone_type == "dinov2":
+        pixel_values = torch.stack([processor(img) for img in images], dim=0).to(device)
+        with torch.no_grad():
+            feats = clip_model(pixel_values)
+        return feats
+
     if backbone_type == "open_clip":
         pixel_values = torch.stack([processor(img) for img in images], dim=0).to(device)
         return clip_model.encode_image(pixel_values)
@@ -261,6 +278,10 @@ def _encode_image_features(clip_model, processor, images, device: torch.device, 
 
 def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
     # CLIP backbones can expose different image feature dimensions (e.g., B32=512, L14=768, RN101=512).
+    if backbone_type == "dinov2":
+        # DINOv2 models all output 768-dim features
+        return 768
+
     if backbone_type == "open_clip":
         dim = getattr(getattr(clip_model, "visual", None), "output_dim", None)
         if isinstance(dim, int) and dim > 0:

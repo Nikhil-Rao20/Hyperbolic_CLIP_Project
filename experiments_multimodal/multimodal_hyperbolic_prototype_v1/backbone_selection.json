@@ -1,8 +1,10 @@
 {
   "default_backbone": "B16",
-  "requested_backbones": [],
+  "requested_backbones": [
+    "DINOV2"
+  ],
   "selected_backbones": [
-    "B16"
+    "DINOV2"
   ],
   "default_num_vit_layers": 12,
   "requested_layers": [],
@@ -35,6 +37,20 @@
       "display_name": "Hyperbolic CLIP ViT RN101",
       "model_name": "RN101",
       "type": "open_clip",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    },
+    "DINOV2": {
+      "display_name": "DINOv2 ViT-Base (Self-Supervised)",
+      "model_name": "dinov2_vits14",
+      "type": "dinov2",
+      "open_clip_pretrained": "openai",
+      "vision_encoder_mode": "fine_tune"
+    },
+    "DINOV2L": {
+      "display_name": "DINOv2 ViT-Large (Self-Supervised)",
+      "model_name": "dinov2_vitl14",
+      "type": "dinov2",
       "open_clip_pretrained": "openai",
       "vision_encoder_mode": "fine_tune"
     }
