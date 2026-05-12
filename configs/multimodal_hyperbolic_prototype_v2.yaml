@@ -20,7 +20,7 @@ target_per_generator: 104
 # ============================================================
 prompt_file: configs/prompts/prompts_converted.json
 
-warmup_epochs: 5
+warmup_epochs: 8
 lambda_align: 0.5
 lambda_reg: 0.1
 margin: 0.5
@@ -31,8 +31,8 @@ fake_num_prototypes: 2
 enable_gan_prompt_enrichment: true
 gan_like_augment_prob: 0.35
 fixed_fpr_targets: [0.01, 0.05, 0.10]
-lambda_spectral: 0.3
-enable_gan_image_prototype: true
+lambda_spectral: 0.2
+enable_gan_image_prototype: false
 gan_image_prototype_samples: 200
 
 # ============================================================
