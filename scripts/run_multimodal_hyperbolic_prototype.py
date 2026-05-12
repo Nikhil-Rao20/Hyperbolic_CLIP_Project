@@ -14,7 +14,7 @@ from collections import defaultdict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -461,6 +461,71 @@ class GANLikeAugmentor:
         for op in random.sample(ops, k=min(n_ops, len(ops))):
             image = op(image)
         return image
+
+
+class SpectralAnomalyScorer:
+    """
+    Computes a frequency-domain anomaly score for each image.
+    Fits a mean log-power azimuthal spectrum on real training images.
+    At inference, returns L2 deviation of each image's log-spectrum from the mean.
+    GAN artifacts (checkerboard, aliasing, upsampling ringing) show up strongly
+    in high-frequency spectral components, making this complementary to spatial CLIP features.
+    """
+    TARGET_SIZE = (224, 224)
+
+    def __init__(self):
+        self.mean_spectrum: np.ndarray | None = None
+        self.n_bins: int = 0
+
+    def _azimuthal_power_spectrum(self, img: Image.Image) -> np.ndarray:
+        gray = img.convert("L").resize(self.TARGET_SIZE, Image.BILINEAR)
+        arr = np.array(gray, dtype=np.float32) / 255.0
+        f = np.fft.fft2(arr)
+        fshift = np.fft.fftshift(f)
+        power = np.abs(fshift) ** 2
+        h, w = power.shape
+        cy, cx = h // 2, w // 2
+        y_idx, x_idx = np.indices((h, w))
+        r = np.sqrt((x_idx - cx) ** 2 + (y_idx - cy) ** 2).astype(int)
+        max_r = min(cx, cy)
+        spectrum = np.zeros(max_r, dtype=np.float64)
+        counts = np.zeros(max_r, dtype=np.int64)
+        mask = r < max_r
+        np.add.at(spectrum, r[mask], power[mask])
+        np.add.at(counts, r[mask], 1)
+        counts = np.maximum(counts, 1)
+        spectrum = spectrum / counts
+        return np.log1p(spectrum).astype(np.float32)
+
+    def fit(self, images: List[Image.Image]) -> None:
+        spectra = [self._azimuthal_power_spectrum(img) for img in images]
+        arr = np.stack(spectra, axis=0)
+        self.mean_spectrum = arr.mean(axis=0)
+        self.n_bins = self.mean_spectrum.shape[0]
+
+    def score(self, images: List[Image.Image]) -> np.ndarray:
+        if self.mean_spectrum is None:
+            raise RuntimeError("SpectralAnomalyScorer must be fit() before score().")
+        scores = []
+        for img in images:
+            s = self._azimuthal_power_spectrum(img)
+            deviation = float(np.linalg.norm(s - self.mean_spectrum))
+            scores.append(deviation)
+        return np.array(scores, dtype=np.float32)
+
+    def to_dict(self) -> dict:
+        return {
+            "mean_spectrum": self.mean_spectrum.tolist() if self.mean_spectrum is not None else None,
+            "n_bins": self.n_bins,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SpectralAnomalyScorer":
+        obj = cls()
+        if d.get("mean_spectrum") is not None:
+            obj.mean_spectrum = np.array(d["mean_spectrum"], dtype=np.float32)
+            obj.n_bins = int(d.get("n_bins", obj.mean_spectrum.shape[0]))
+        return obj
 
 
 def multimodal_collate_fn(batch):
@@ -1041,6 +1106,49 @@ def compute_prototype_fake_multi(
 
 
 @torch.no_grad()
+def compute_prototype_fake_gan_image(
+    clip_model,
+    processor,
+    projection_head,
+    train_dataset: MultimodalPromptDataset,
+    batch_size: int,
+    device: torch.device,
+    geometry: str,
+    backbone_type: str,
+    n_aug_samples: int = 200,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Builds a fake prototype from IMAGE features of GAN-augmented real training images.
+    Unlike the text-only fake prototypes, this places a reference point in hyperbolic
+    space based on what actual GAN-style augmented images look like as image embeddings.
+    This gives the model an image-space signal for GAN-like artifacts.
+    """
+    clip_model.eval()
+    projection_head.eval()
+    rng = random.Random(seed)
+    augmentor = GANLikeAugmentor(prob=1.0, min_ops=2, max_ops=4)
+
+    all_indices = list(range(len(train_dataset)))
+    chosen = rng.sample(all_indices, k=min(n_aug_samples, len(all_indices)))
+
+    image_embs = []
+    for start in range(0, len(chosen), batch_size):
+        batch_indices = chosen[start:start + batch_size]
+        imgs = []
+        for i in batch_indices:
+            raw_img = Image.open(train_dataset.dataset_root / train_dataset.rel_paths[i]).convert("RGB")
+            imgs.append(augmentor(raw_img))
+        feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
+        image_embs.append(_project_image(projection_head, feats).detach())
+
+    all_embs = torch.cat(image_embs, dim=0)
+    if geometry == "hyperbolic":
+        return frechet_mean_iterative(all_embs, projection_head.curvature)
+    return all_embs.mean(dim=0)
+
+
+@torch.no_grad()
 def compute_anomaly_scores_multimodal(
     clip_model,
     processor,
@@ -1052,12 +1160,28 @@ def compute_anomaly_scores_multimodal(
     device,
     geometry: str,
     backbone_type: str,
+    spectral_scorer: "SpectralAnomalyScorer | None" = None,
+    mu_spatial: float = 0.0,
+    sigma_spatial: float = 1.0,
+    mu_spectral: float = 0.0,
+    sigma_spectral: float = 1.0,
+    lambda_spectral: float = 0.0,
 ):
+    """
+    Computes per-image anomaly scores.
+    If spectral_scorer is provided and lambda_spectral > 0, fuses:
+      z_spatial = (spatial_score - mu_spatial) / sigma_spatial
+      z_spectral = (spectral_score - mu_spectral) / sigma_spectral
+      fused = (1 - lambda_spectral) * z_spatial + lambda_spectral * z_spectral
+    Otherwise returns the raw spatial score (backward compatible).
+    """
     clip_model.eval()
     projection_head.eval()
     p_real = p_real.to(device)
     p_fake = p_fake.to(device)
-    scores, labels, sources, ids = [], [], [], []
+    spatial_scores, spectral_scores_list = [], []
+    labels, sources, ids = [], [], []
+    all_images_for_spectral = []
 
     for start in range(0, len(dataset), batch_size):
         end = min(start + batch_size, len(dataset))
@@ -1084,12 +1208,24 @@ def compute_anomaly_scores_multimodal(
                 dist_fake = torch.norm(proj.unsqueeze(1) - p_fake.unsqueeze(0), dim=-1).min(dim=1).values
 
         score = dist_real - dist_fake
-        scores.extend(score.detach().cpu().numpy().tolist())
+        spatial_scores.extend(score.detach().cpu().numpy().tolist())
         labels.extend(lbs)
         sources.extend(srcs)
         ids.extend(rels)
+        if spectral_scorer is not None and lambda_spectral > 0.0:
+            all_images_for_spectral.extend(imgs)
 
-    return np.array(labels), np.array(scores), sources, ids
+    spatial_arr = np.array(spatial_scores, dtype=np.float32)
+
+    if spectral_scorer is not None and lambda_spectral > 0.0 and len(all_images_for_spectral) > 0:
+        spectral_arr = spectral_scorer.score(all_images_for_spectral)
+        z_spatial = (spatial_arr - mu_spatial) / (sigma_spatial + 1e-8)
+        z_spectral = (spectral_arr - mu_spectral) / (sigma_spectral + 1e-8)
+        final_scores = (1.0 - lambda_spectral) * z_spatial + lambda_spectral * z_spectral
+    else:
+        final_scores = spatial_arr
+
+    return np.array(labels), final_scores, sources, ids
 
 
 def build_optimizer(clip_model, projection_head, cfg):
@@ -1174,10 +1310,43 @@ def train_one_epoch_multimodal(
     return running / max(n_batches, 1)
 
 
-def evaluate_test_set(clip_model, processor, projection_head, p_real, p_fake, dataset, batch_size, device, geometry: str, thresholds: Dict[str, float], out_dir: Path, title_prefix: str, backbone_type: str):
+def evaluate_test_set(
+    clip_model,
+    processor,
+    projection_head,
+    p_real,
+    p_fake,
+    dataset,
+    batch_size,
+    device,
+    geometry: str,
+    thresholds: Dict[str, float],
+    out_dir: Path,
+    title_prefix: str,
+    backbone_type: str,
+    per_image_scores: Optional[Dict[str, Dict[str, List]]] = None,
+    test_key: str = "",
+    spectral_scorer: "SpectralAnomalyScorer | None" = None,
+    mu_spatial: float = 0.0,
+    sigma_spatial: float = 1.0,
+    mu_spectral: float = 0.0,
+    sigma_spectral: float = 1.0,
+    lambda_spectral: float = 0.0,
+):
     labels, scores, sources, ids = compute_anomaly_scores_multimodal(
-        clip_model, processor, projection_head, p_real, p_fake, dataset, batch_size, device, geometry, backbone_type
+        clip_model, processor, projection_head, p_real, p_fake, dataset, batch_size, device, geometry, backbone_type,
+        spectral_scorer=spectral_scorer,
+        mu_spatial=mu_spatial, sigma_spatial=sigma_spatial,
+        mu_spectral=mu_spectral, sigma_spectral=sigma_spectral,
+        lambda_spectral=lambda_spectral,
     )
+
+    if per_image_scores is not None and test_key:
+        per_image_scores[test_key] = {
+            "scores": scores.tolist(),
+            "labels": labels.tolist(),
+            "image_paths": list(ids),
+        }
 
     real_scores = scores[labels == 0]
     fake_scores = scores[labels == 1]
@@ -1237,6 +1406,9 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     gan_like_augment_prob = float(cfg.get("gan_like_augment_prob", 0.35))
     fixed_fpr_targets = cfg.get("fixed_fpr_targets", [0.01, 0.05, 0.10])
     fixed_fpr_targets = [float(v) for v in fixed_fpr_targets if 0.0 < float(v) < 1.0]
+    lambda_spectral = float(cfg.get("lambda_spectral", 0.3))
+    enable_gan_image_prototype = bool(cfg.get("enable_gan_image_prototype", True))
+    gan_image_prototype_samples = int(cfg.get("gan_image_prototype_samples", 200))
 
     set_global_determinism(seed)
 
@@ -1307,6 +1479,16 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     steps_per_epoch = math.ceil(len(train_ds) / batch_size)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(steps_per_epoch * epochs, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+
+    # Fit spectral scorer on real training images (one-time, before training loop)
+    print(f"  [{geometry}] Fitting spectral anomaly scorer on {len(train_ds)} training images...", flush=True)
+    spectral_scorer = SpectralAnomalyScorer()
+    train_images_for_spectral = [
+        Image.open(dataset_root / train_ds.rel_paths[i]).convert("RGB")
+        for i in range(len(train_ds))
+    ]
+    spectral_scorer.fit(train_images_for_spectral)
+    del train_images_for_spectral
 
     best_auroc = -1.0
     best_payload = None
@@ -1400,14 +1582,48 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         prototype_distance_epochs.append(epoch)
         prototype_distance_values.append(sep)
 
+        # GAN image-based fake prototype (computed fresh each epoch after model updates)
+        if enable_gan_image_prototype:
+            p_fake_gan_img = compute_prototype_fake_gan_image(
+                clip_model, processor, projection_head, train_ds, batch_size,
+                device, geometry, backbone_type,
+                n_aug_samples=gan_image_prototype_samples, seed=seed + epoch,
+            )
+            # Stack with existing text-based prototypes
+            if p_fake.ndim == 1:
+                p_fake_combined = torch.stack([p_fake, p_fake_gan_img], dim=0)
+            else:
+                p_fake_combined = torch.cat([p_fake, p_fake_gan_img.unsqueeze(0)], dim=0)
+        else:
+            p_fake_combined = p_fake
+
+        # Recompute val_in spatial scores with combined prototypes
         val_in_labels, val_in_scores, _, _ = compute_anomaly_scores_multimodal(
-            clip_model, processor, projection_head, p_real, p_fake, val_real_ds, batch_size, device, geometry, backbone_type
+            clip_model, processor, projection_head, p_real, p_fake_combined,
+            val_real_ds, batch_size, device, geometry, backbone_type,
         )
-        _ = val_in_labels
+
+        # Compute spectral scores on val_in (real-only) for normalization stats
+        val_in_images = [
+            Image.open(dataset_root / val_real_ds.rel_paths[i]).convert("RGB")
+            for i in range(len(val_real_ds))
+        ]
+        val_in_spectral = spectral_scorer.score(val_in_images)
+        mu_spatial = float(np.mean(val_in_scores))
+        sigma_spatial = float(np.std(val_in_scores) + 1e-8)
+        mu_spectral = float(np.mean(val_in_spectral))
+        sigma_spectral = float(np.std(val_in_spectral) + 1e-8)
+        del val_in_images
+
+        # Recompute val_eval scores with combined prototypes and fusion
         val_eval_labels, val_eval_scores, val_eval_sources, _ = compute_anomaly_scores_multimodal(
-            clip_model, processor, projection_head, p_real, p_fake, val_eval_ds, batch_size, device, geometry, backbone_type
+            clip_model, processor, projection_head, p_real, p_fake_combined,
+            val_eval_ds, batch_size, device, geometry, backbone_type,
+            spectral_scorer=spectral_scorer,
+            mu_spatial=mu_spatial, sigma_spatial=sigma_spatial,
+            mu_spectral=mu_spectral, sigma_spectral=sigma_spectral,
+            lambda_spectral=lambda_spectral,
         )
-        _ = val_eval_sources
 
         default_threshold = max(float(np.percentile(val_in_scores, threshold_percentile)), 0.0)
         best_f1, best_j = calibrate_threshold(val_eval_labels, val_eval_scores)
@@ -1430,7 +1646,14 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 "clip_model": clip_model.state_dict(),
                 "projection_head": projection_head.state_dict(),
                 "p_real": p_real.detach().cpu(),
-                "p_fake": p_fake.detach().cpu(),
+                "p_fake": p_fake_combined.detach().cpu(),
+                "val_real_scores": val_in_scores.tolist(),
+                "spectral_scorer": spectral_scorer.to_dict(),
+                "mu_spatial": mu_spatial,
+                "sigma_spatial": sigma_spatial,
+                "mu_spectral": mu_spectral,
+                "sigma_spectral": sigma_spectral,
+                "lambda_spectral": lambda_spectral,
                 "default_threshold": default_threshold,
                 "calibrated_threshold_f1": best_f1["threshold"],
                 "calibrated_threshold_youden_j": best_j["threshold"],
@@ -1638,7 +1861,15 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
             "youden_j": float(ckpt["calibrated_threshold_youden_j"]),
             "default": float(ckpt["default_threshold"]),
         }
-    return clip_model, processor, projection_head, p_real, p_fake, thresholds
+    val_real_scores = ckpt.get("val_real_scores", [])
+    spectral_scorer = SpectralAnomalyScorer.from_dict(ckpt.get("spectral_scorer", {}))
+    mu_spatial = float(ckpt.get("mu_spatial", 0.0))
+    sigma_spatial = float(ckpt.get("sigma_spatial", 1.0))
+    mu_spectral = float(ckpt.get("mu_spectral", 0.0))
+    sigma_spectral = float(ckpt.get("sigma_spectral", 1.0))
+    lambda_spectral = float(ckpt.get("lambda_spectral", 0.0))
+    return (clip_model, processor, projection_head, p_real, p_fake, thresholds, val_real_scores,
+            spectral_scorer, mu_spatial, sigma_spatial, mu_spectral, sigma_spectral, lambda_spectral)
 
 
 def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, geometry_dir: Path) -> Dict:
@@ -1667,7 +1898,8 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         json.dump({"folds": fold_summaries, "best_fold": best_fold}, f, indent=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    clip_model, processor, projection_head, p_real, p_fake, thresholds = load_best_model(
+    (clip_model, processor, projection_head, p_real, p_fake, thresholds, val_real_scores,
+     spectral_scorer, mu_spatial, sigma_spatial, mu_spectral, sigma_spectral, lambda_spectral) = load_best_model(
         cfg,
         geometry,
         Path(best_fold["checkpoint_path"]),
@@ -1678,6 +1910,13 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
 
     test_results = {}
     summary_rows = []
+    per_image_scores_payload = {
+        "val_real_scores": val_real_scores,
+        "test_gan": {"scores": [], "labels": [], "image_paths": []},
+        "test_ldm": {"scores": [], "labels": [], "image_paths": []},
+        "test_mls": {"scores": [], "labels": [], "image_paths": []},
+        "test_allfake": {"scores": [], "labels": [], "image_paths": []},
+    }
 
     for test_name, test_spec in manifest["test_sets"].items():
         test_dir = geometry_dir / test_name
@@ -1699,6 +1938,12 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
             test_dir,
             f"{geometry} {test_name}",
             backbone_type,
+            per_image_scores=per_image_scores_payload,
+            test_key=test_name,
+            spectral_scorer=spectral_scorer,
+            mu_spatial=mu_spatial, sigma_spatial=sigma_spatial,
+            mu_spectral=mu_spectral, sigma_spectral=sigma_spectral,
+            lambda_spectral=lambda_spectral,
         )
 
         payload = {
@@ -1800,6 +2045,9 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
             }
         )
 
+    with (geometry_dir / "per_image_scores.json").open("w", encoding="utf-8") as f:
+        json.dump(per_image_scores_payload, f, indent=2)
+
         test_results[test_name] = payload
         print(
             f"[TEST] geometry={geometry} set={test_name} auroc={result['auroc']:.4f} auprc={result['auprc']:.4f} "
@@ -1831,7 +2079,8 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
 
     for fold_summary in fold_summaries:
         fold_index = fold_summary["fold_index"]
-        fold_model, fold_processor, fold_projection_head, fold_p_real, fold_p_fake, fold_thresholds = load_best_model(
+        (fold_model, fold_processor, fold_projection_head, fold_p_real, fold_p_fake, fold_thresholds, fold_val_real_scores,
+         fold_spectral_scorer, fold_mu_spatial, fold_sigma_spatial, fold_mu_spectral, fold_sigma_spectral, fold_lambda_spectral) = load_best_model(
             cfg,
             geometry,
             Path(fold_summary["checkpoint_path"]),
@@ -1856,8 +2105,12 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
                 geometry,
                 fold_thresholds,
                 test_dir,
-                f"{geometry} {test_name}",
+                f"{geometry} {test_name} fold-{fold_index}",
                 backbone_type,
+                spectral_scorer=fold_spectral_scorer,
+                mu_spatial=fold_mu_spatial, sigma_spatial=fold_sigma_spatial,
+                mu_spectral=fold_mu_spectral, sigma_spectral=fold_sigma_spectral,
+                lambda_spectral=fold_lambda_spectral,
             )
 
             fold_metrics = {
