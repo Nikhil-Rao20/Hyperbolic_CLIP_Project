@@ -1341,26 +1341,6 @@ def evaluate_test_set(
         lambda_spectral=lambda_spectral,
     )
 
-    # Test-time score renormalization using real image score statistics.
-    # Corrects for distribution shift between val_real and test_real when
-    # spectral fusion is active (lambda_spectral > 0). Safe — uses only
-    # real image scores (labels == 0), no fake label leakage.
-    if lambda_spectral > 0.0:
-        real_mask = labels == 0
-        if real_mask.sum() > 1:
-            test_real_scores = scores[real_mask]
-            mu_test = float(np.mean(test_real_scores))
-            sigma_test = float(np.std(test_real_scores) + 1e-8)
-            scores = (scores - mu_test) / sigma_test
-            
-            # Recompute threshold in renormalized test score space.
-            # Use 95th percentile of renormalized real scores as the operating threshold.
-            # This replaces all val-calibrated thresholds with a single test-adaptive one.
-            test_adaptive_threshold = float(np.percentile(scores[real_mask], 95))
-            # Inject into thresholds dict so it appears in all downstream metric computation
-            thresholds = dict(thresholds)
-            thresholds["test_adaptive"] = test_adaptive_threshold
-
     if per_image_scores is not None and test_key:
         per_image_scores[test_key] = {
             "scores": scores.tolist(),
@@ -1630,9 +1610,17 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         ]
         val_in_spectral = spectral_scorer.score(val_in_images)
         mu_spatial = float(np.mean(val_in_scores))
-        sigma_spatial = float(np.std(val_in_scores) + 1e-8)
+        sigma_spatial = float(max(np.std(val_in_scores), 0.05))
         mu_spectral = float(np.mean(val_in_spectral))
-        sigma_spectral = float(np.std(val_in_spectral) + 1e-8)
+        sigma_spectral = float(max(np.std(val_in_spectral), 0.05))
+
+        if epoch == 1 or epoch == warmup_epochs + 1:
+            print(
+                f"  [{geometry}] fold={fold['fold_index']} epoch={epoch} "
+                f"norm_stats: mu_sp={mu_spatial:.4f} sig_sp={sigma_spatial:.4f} "
+                f"mu_spec={mu_spectral:.4f} sig_spec={sigma_spectral:.4f}",
+                flush=True,
+            )
         del val_in_images
 
         # Recompute val_eval scores with combined prototypes and fusion
