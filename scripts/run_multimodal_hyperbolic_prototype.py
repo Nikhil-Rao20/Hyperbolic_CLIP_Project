@@ -1610,7 +1610,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         ]
         val_in_spectral = spectral_scorer.score(val_in_images)
         mu_spatial = float(np.mean(val_in_scores))
-        sigma_spatial = float(max(np.std(val_in_scores), 0.05))
+        sigma_spatial = float(max(np.std(val_in_scores), 0.10))
         mu_spectral = float(np.mean(val_in_spectral))
         sigma_spectral = float(max(np.std(val_in_spectral), 0.05))
 
