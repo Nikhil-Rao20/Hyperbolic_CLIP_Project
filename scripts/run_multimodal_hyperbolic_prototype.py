@@ -463,6 +463,149 @@ class GANLikeAugmentor:
         return image
 
 
+class CLAHEAugmentor:
+    """
+    Contrast Limited Adaptive Histogram Equalization (CLAHE) augmentation.
+    Enhances local contrast in MRI images, making subtle intensity variations
+    more discriminative. Applied per-channel on RGB-converted MRI images.
+    Helps tighten the real prototype by normalizing scanner-specific contrast differences.
+    """
+
+    def __init__(self, prob: float = 0.5, clip_limit: float = 2.0, tile_grid_size: int = 8):
+        self.prob = float(prob)
+        self.clip_limit = float(clip_limit)
+        self.tile_grid_size = int(tile_grid_size)
+
+    def _apply_clahe(self, img: Image.Image) -> Image.Image:
+        try:
+            import cv2
+
+            arr = np.array(img)
+            clahe = cv2.createCLAHE(
+                clipLimit=self.clip_limit,
+                tileGridSize=(self.tile_grid_size, self.tile_grid_size),
+            )
+            if arr.ndim == 3:
+                lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+                lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+            else:
+                arr = clahe.apply(arr)
+            return Image.fromarray(arr)
+        except ImportError:
+            # Fallback: PIL-based local contrast enhancement if cv2 unavailable
+            return ImageEnhance.Contrast(img).enhance(1.5)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > self.prob:
+            return image
+        return self._apply_clahe(image)
+
+
+class GaussianNoiseAugmentor:
+    """
+    Adds Gaussian noise to real training images.
+    Forces the CLIP features and spectral scorer to be robust to acquisition noise,
+    broadening the real distribution slightly to improve specificity at test time.
+    Noise std is sampled uniformly from [min_std, max_std] per image.
+    """
+
+    def __init__(self, prob: float = 0.5, min_std: float = 0.01, max_std: float = 0.05):
+        self.prob = float(prob)
+        self.min_std = float(min_std)
+        self.max_std = float(max_std)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > self.prob:
+            return image
+        arr = np.array(image).astype(np.float32) / 255.0
+        std = random.uniform(self.min_std, self.max_std)
+        noise = np.random.normal(0.0, std, arr.shape).astype(np.float32)
+        arr = np.clip(arr + noise, 0.0, 1.0)
+        return Image.fromarray((arr * 255).astype(np.uint8))
+
+
+class CutMixAugmentor:
+    """
+    CutMix augmentation for one-class setting: randomly pastes a rectangular
+    patch from another real training image onto the current image.
+    Builds a pool of images at first call and samples from it.
+    Encourages the model to focus on local texture rather than global structure,
+    which may improve robustness to GAN artifacts.
+    """
+
+    def __init__(self, prob: float = 0.5, min_cut_ratio: float = 0.1, max_cut_ratio: float = 0.4):
+        self.prob = float(prob)
+        self.min_cut_ratio = float(min_cut_ratio)
+        self.max_cut_ratio = float(max_cut_ratio)
+        self._pool: List[Image.Image] = []
+
+    def set_pool(self, images: List[Image.Image]) -> None:
+        self._pool = images
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if random.random() > self.prob or len(self._pool) < 2:
+            return image
+        w, h = image.size
+        cut_ratio = random.uniform(self.min_cut_ratio, self.max_cut_ratio)
+        cut_w = int(w * cut_ratio)
+        cut_h = int(h * cut_ratio)
+        cx = random.randint(0, max(0, w - cut_w))
+        cy = random.randint(0, max(0, h - cut_h))
+        donor = random.choice(self._pool).resize((w, h), Image.BILINEAR)
+        result = image.copy()
+        patch = donor.crop((cx, cy, cx + cut_w, cy + cut_h))
+        result.paste(patch, (cx, cy))
+        return result
+
+
+def build_train_augmentor(cfg: dict):
+    """
+    Builds the training augmentor based on config.
+    augmentation_type controls which augmentor is active:
+      'gan_like'       — original GANLikeAugmentor (default)
+      'clahe'          — CLAHEAugmentor only
+      'gaussian_noise' — GaussianNoiseAugmentor only
+      'cutmix'         — CutMixAugmentor only (pool set later)
+      'none'           — no augmentation
+    Returns (augmentor, augmentor_type_str)
+    """
+    aug_type = str(cfg.get("augmentation_type", "gan_like")).lower().strip()
+    prob = float(cfg.get("augmentation_prob", 0.5))
+
+    if aug_type == "clahe":
+        return (
+            CLAHEAugmentor(
+                prob=prob,
+                clip_limit=float(cfg.get("clahe_clip_limit", 2.0)),
+                tile_grid_size=int(cfg.get("clahe_tile_grid_size", 8)),
+            ),
+            "clahe",
+        )
+    elif aug_type == "gaussian_noise":
+        return (
+            GaussianNoiseAugmentor(
+                prob=prob,
+                min_std=float(cfg.get("gaussian_noise_min_std", 0.01)),
+                max_std=float(cfg.get("gaussian_noise_max_std", 0.05)),
+            ),
+            "gaussian_noise",
+        )
+    elif aug_type == "cutmix":
+        return (
+            CutMixAugmentor(
+                prob=prob,
+                min_cut_ratio=float(cfg.get("cutmix_min_ratio", 0.1)),
+                max_cut_ratio=float(cfg.get("cutmix_max_ratio", 0.4)),
+            ),
+            "cutmix",
+        )
+    elif aug_type == "none":
+        return None, "none"
+    else:
+        return GANLikeAugmentor(prob=float(cfg.get("gan_like_augment_prob", 0.35))), "gan_like"
+
+
 class SpectralAnomalyScorer:
     """
     Computes a frequency-domain anomaly score for each image.
@@ -1453,7 +1596,8 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     real_prompts_fold = list(itertools.islice(itertools.cycle(real_prompts_pool), n_train))
     fake_prompts_fold = list(itertools.islice(itertools.cycle(fake_prompts_pool), n_train))
 
-    train_augmentor = GANLikeAugmentor(prob=gan_like_augment_prob)
+    train_augmentor, aug_type_str = build_train_augmentor(cfg)
+    print(f"  [{geometry}] fold={fold['fold_index']} augmentation={aug_type_str}", flush=True)
     train_ds = MultimodalPromptDataset(
         dataset_root,
         fold["train_ids"],
@@ -1483,10 +1627,17 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     # Fit spectral scorer on real training images (one-time, before training loop)
     print(f"  [{geometry}] Fitting spectral anomaly scorer on {len(train_ds)} training images...", flush=True)
     spectral_scorer = SpectralAnomalyScorer()
-    train_images_for_spectral = [
-        Image.open(dataset_root / train_ds.rel_paths[i]).convert("RGB")
-        for i in range(len(train_ds))
-    ]
+    train_images_for_spectral = []
+    for i in range(len(train_ds)):
+        img = Image.open(dataset_root / train_ds.rel_paths[i]).convert("RGB")
+        if train_augmentor is not None:
+            img = train_augmentor(img)
+        train_images_for_spectral.append(img)
+
+    # For CutMix: set the image pool before fitting spectral scorer
+    if isinstance(train_augmentor, CutMixAugmentor):
+        train_augmentor.set_pool(train_images_for_spectral)
+
     spectral_scorer.fit(train_images_for_spectral)
     del train_images_for_spectral
 
