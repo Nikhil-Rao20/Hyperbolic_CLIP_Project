@@ -1,0 +1,98 @@
+# ============================================================
+# Multimodal Hyperbolic Prototype Classification Config v2d (Gaussian + GAN Proto)
+# Reference: multimodal_hyperbolic_prototype_v2d_gaussian.yaml
+# ============================================================
+
+dataset_root: RGIIIT_clean
+output_root: experiments_multimodal
+run_name: multimodal_hyperbolic_prototype_v2d_gaussian_ganproto
+
+seed: 42
+n_folds: 5
+protocol_manifest_path: configs/manifests/cleaned_protocol_manifest.json
+
+target_real_train_images: 500
+target_per_generator: 104
+
+# ============================================================
+# NEW - Multimodal specific keys
+# ============================================================
+prompt_file: configs/prompts/prompts_converted.json
+
+warmup_epochs: 8
+lambda_align: 0.5
+lambda_reg: 0.1
+margin: 0.5
+
+# GAN-generalization robustness controls
+hard_negative_weight: 1.0
+fake_num_prototypes: 2
+enable_gan_prompt_enrichment: true
+gan_like_augment_prob: 0.35
+augmentation_type: gaussian_noise
+augmentation_prob: 0.5
+gaussian_noise_min_std: 0.01
+gaussian_noise_max_std: 0.05
+fixed_fpr_targets: [0.01, 0.05, 0.10]
+lambda_spectral: 0.1
+enable_gan_image_prototype: true
+gan_image_prototype_samples: 200
+
+# ============================================================
+# Backbone registry (identical to reference)
+# ============================================================
+clip_model_name: openai/clip-vit-base-patch16
+default_backbone: B16
+backbone_registry:
+  B16:
+    display_name: Hyperbolic CLIP ViT B16
+    model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: fine_tune
+  B32:
+    display_name: Hyperbolic CLIP ViT B32
+    model_name: openai/clip-vit-base-patch32
+    vision_encoder_mode: fine_tune
+  L14:
+    display_name: Hyperbolic CLIP ViT L14 (Official Large)
+    model_name: openai/clip-vit-large-patch14
+    vision_encoder_mode: fine_tune
+  RN101:
+    display_name: Hyperbolic CLIP ViT RN101
+    type: open_clip
+    model_name: RN101
+    open_clip_pretrained: openai
+    vision_encoder_mode: fine_tune
+  DINO_V2:
+    display_name: DINOv2 ViT-Base (Self-Supervised)
+    type: dinov2
+    model_name: dinov2_vits14
+    text_model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: fine_tune
+  DINO_V2_L:
+    display_name: DINOv2 ViT-Large (Self-Supervised)
+    type: dinov2
+    model_name: dinov2_vitl14
+    text_model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: fine_tune
+
+# ============================================================
+# Training hyperparameters
+# ============================================================
+batch_size: 32
+epochs: 30
+num_workers: 0
+projection_dim: 256
+threshold_percentile: 95
+lr_image: 1.0e-5
+lr_projection: 1.0e-4
+weight_decay: 1.0e-4
+curvature: 1.0
+scale: 0.1
+
+backbone:
+  model_name: openai/clip-vit-base-patch16
+  vision_encoder_mode: fine_tune
+  num_vit_layers: 12
+
+geometries:
+  - hyperbolic

@@ -1641,6 +1641,10 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     spectral_scorer.fit(train_images_for_spectral)
     del train_images_for_spectral
 
+    # GAN image prototype computed once after warmup
+    p_fake_gan_img = None
+    p_fake_combined = None
+
     best_auroc = -1.0
     best_payload = None
     log_rows = []
@@ -1675,12 +1679,43 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         )
 
         warmup_mode = epoch <= warmup_epochs
+        if epoch == warmup_epochs + 1 and enable_gan_image_prototype:
+            print(
+                f"  [{geometry}] fold={fold['fold_index']} epoch={epoch} - computing GAN image prototype (one-time)",
+                flush=True,
+            )
+            p_fake_gan_img = compute_prototype_fake_gan_image(
+                clip_model,
+                processor,
+                projection_head,
+                train_ds,
+                batch_size,
+                device,
+                geometry,
+                backbone_type,
+                n_aug_samples=gan_image_prototype_samples,
+                seed=seed,
+            )
+            print(
+                f"  [{geometry}] fold={fold['fold_index']} GAN image prototype computed, shape={tuple(p_fake_gan_img.shape)}",
+                flush=True,
+            )
+
+        if enable_gan_image_prototype and p_fake_gan_img is not None:
+            p_fake_gan_img_dev = p_fake_gan_img.to(device)
+            if p_fake.ndim == 1:
+                p_fake_combined = torch.stack([p_fake, p_fake_gan_img_dev], dim=0)
+            else:
+                p_fake_combined = torch.cat([p_fake, p_fake_gan_img_dev.unsqueeze(0)], dim=0)
+        else:
+            p_fake_combined = p_fake
+
         train_loss = train_one_epoch_multimodal(
             clip_model,
             processor,
             projection_head,
             p_real,
-            p_fake,
+            p_fake_combined,
             train_loader,
             optimizer,
             scheduler,
@@ -1717,36 +1752,30 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             fake_num_prototypes,
         )
 
+        if enable_gan_image_prototype and p_fake_gan_img is not None:
+            p_fake_gan_img_dev = p_fake_gan_img.to(device)
+            if p_fake.ndim == 1:
+                p_fake_combined = torch.stack([p_fake, p_fake_gan_img_dev], dim=0)
+            else:
+                p_fake_combined = torch.cat([p_fake, p_fake_gan_img_dev.unsqueeze(0)], dim=0)
+        else:
+            p_fake_combined = p_fake
+
         if geometry == "hyperbolic":
             # ensure prototypes are on the same device as the projection head/ball
             p_real_dev = p_real.to(device) if p_real.device != device else p_real
-            p_fake_dev = p_fake.to(device) if p_fake.device != device else p_fake
+            p_fake_dev = p_fake_combined.to(device)
             dist_all = hyperbolic_distance(p_real_dev.unsqueeze(0), p_fake_dev, projection_head.ball)
             sep = float(dist_all.min().item() if dist_all.ndim > 1 else dist_all[0].item())
         else:
             p_real_dev = p_real.to(device)
-            p_fake_dev = p_fake.to(device)
+            p_fake_dev = p_fake_combined.to(device)
             if p_fake_dev.ndim == 1:
                 sep = float(torch.norm(p_real_dev - p_fake_dev).item())
             else:
                 sep = float(torch.norm(p_real_dev.unsqueeze(0) - p_fake_dev, dim=-1).min().item())
         prototype_distance_epochs.append(epoch)
         prototype_distance_values.append(sep)
-
-        # GAN image-based fake prototype (computed fresh each epoch after model updates)
-        if enable_gan_image_prototype:
-            p_fake_gan_img = compute_prototype_fake_gan_image(
-                clip_model, processor, projection_head, train_ds, batch_size,
-                device, geometry, backbone_type,
-                n_aug_samples=gan_image_prototype_samples, seed=seed + epoch,
-            )
-            # Stack with existing text-based prototypes
-            if p_fake.ndim == 1:
-                p_fake_combined = torch.stack([p_fake, p_fake_gan_img], dim=0)
-            else:
-                p_fake_combined = torch.cat([p_fake, p_fake_gan_img.unsqueeze(0)], dim=0)
-        else:
-            p_fake_combined = p_fake
 
         # Recompute val_in spatial scores with combined prototypes
         val_in_labels, val_in_scores, _, _ = compute_anomaly_scores_multimodal(
