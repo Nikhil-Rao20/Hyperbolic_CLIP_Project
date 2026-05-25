@@ -75,6 +75,13 @@ backbone_registry:
     text_model_name: openai/clip-vit-base-patch16
     vision_encoder_mode: fine_tune
 
+  INSTRUCTBLIP:
+    display_name: InstructBLIP (Image-Only) + CLIP Text
+    type: instructblip
+    model_name: Salesforce/instructblip-flan-t5-xl
+    text_model_name: openai/clip-vit-base-patch16
+    vision_encoder_mode: frozen
+
 # ============================================================
 # Training hyperparameters
 # ============================================================

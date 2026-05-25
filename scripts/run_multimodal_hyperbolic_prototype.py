@@ -154,7 +154,7 @@ def _apply_backbone_to_cfg(base_cfg: dict, backbone_spec: Dict) -> dict:
     backbone_cfg["open_clip_pretrained"] = backbone_spec.get("open_clip_pretrained", "openai")
     backbone_cfg["vision_encoder_mode"] = backbone_spec.get("vision_encoder_mode", backbone_cfg.get("vision_encoder_mode", "fine_tune"))
     cfg["backbone"] = backbone_cfg
-    if backbone_cfg["type"] == "dinov2":
+    if backbone_cfg["type"] in {"dinov2", "instructblip"}:
         cfg["clip_text_model_name"] = backbone_spec.get("text_model_name", cfg.get("clip_model_name"))
     else:
         cfg["clip_model_name"] = backbone_spec["model_name"]
@@ -230,6 +230,54 @@ class DinoWithClipText(nn.Module):
         return self.text_model.get_text_features(**inputs)
 
 
+class InstructBlipImageEncoder(nn.Module):
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+        qformer = getattr(model, "qformer", None)
+        hidden_size = getattr(getattr(qformer, "config", None), "hidden_size", None)
+        self.output_dim = int(hidden_size) if isinstance(hidden_size, int) and hidden_size > 0 else 768
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # Extract pooled Q-Former query embeddings as a compact image representation.
+        vision_model = getattr(self.model, "vision_model", None) or getattr(self.model, "vision_encoder", None)
+        qformer = getattr(self.model, "qformer", None)
+        query_tokens = getattr(self.model, "query_tokens", None)
+
+        if vision_model is None or qformer is None or query_tokens is None:
+            raise RuntimeError(
+                "Unsupported InstructBLIP model structure; expected attributes vision_model, qformer, query_tokens."
+            )
+
+        vision_outputs = vision_model(pixel_values=pixel_values, return_dict=True)
+        image_embeds = vision_outputs.last_hidden_state
+        image_attention_mask = torch.ones(
+            image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device
+        )
+        query_tokens_expanded = query_tokens.expand(image_embeds.shape[0], -1, -1)
+        qformer_outputs = qformer(
+            query_embeds=query_tokens_expanded,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_attention_mask,
+            return_dict=True,
+        )
+        query_features = qformer_outputs.last_hidden_state
+        return query_features.mean(dim=1)
+
+
+class InstructBlipWithClipText(nn.Module):
+    def __init__(self, image_model: nn.Module, text_model: CLIPModel):
+        super().__init__()
+        self.image_model = image_model
+        self.text_model = text_model
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.image_model(pixel_values)
+
+    def get_text_features(self, **inputs) -> torch.Tensor:
+        return self.text_model.get_text_features(**inputs)
+
+
 def _load_image_backbone(
     backbone_name: str,
     backbone_type: str,
@@ -255,6 +303,34 @@ def _load_image_backbone(
             "text": CLIPProcessor.from_pretrained(text_model_name),
         }
         return DinoWithClipText(image_model, text_model), processor
+
+    if backbone_type == "instructblip":
+        if not text_model_name:
+            raise RuntimeError(
+                "InstructBLIP backbone requires clip_text_model_name for CLIP text encoding (image-only InstructBLIP)."
+            )
+        try:
+            from transformers import InstructBlipForConditionalGeneration, InstructBlipProcessor
+        except Exception as exc:
+            raise ImportError(
+                "transformers must include InstructBLIP support. Please upgrade transformers (>=4.40 recommended)."
+            ) from exc
+
+        # Use fp16 on CUDA to make this backbone feasible; keep fp32 on CPU.
+        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+        image_model_full = InstructBlipForConditionalGeneration.from_pretrained(
+            backbone_name,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        ).to(device)
+        image_encoder = InstructBlipImageEncoder(image_model_full).to(device)
+        text_model = CLIPModel.from_pretrained(text_model_name, use_safetensors=True).to(device)
+
+        processor = {
+            "image": InstructBlipProcessor.from_pretrained(backbone_name),
+            "text": CLIPProcessor.from_pretrained(text_model_name),
+        }
+        return InstructBlipWithClipText(image_encoder, text_model), processor
 
     if backbone_type == "open_clip":
         if open_clip is None:
@@ -296,6 +372,12 @@ def _encode_image_features(clip_model, processor, images, device: torch.device, 
             feats = clip_model(pixel_values)
         return feats
 
+    if backbone_type == "instructblip":
+        image_processor = processor["image"] if isinstance(processor, dict) else processor
+        inputs = image_processor(images=images, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+        return clip_model(pixel_values)
+
     if backbone_type == "open_clip":
         pixel_values = torch.stack([processor(img) for img in images], dim=0).to(device)
         return clip_model.encode_image(pixel_values)
@@ -323,6 +405,13 @@ def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
             return dim
         return 512
 
+    if backbone_type == "instructblip":
+        image_model = getattr(clip_model, "image_model", None)
+        dim = getattr(image_model, "output_dim", None)
+        if isinstance(dim, int) and dim > 0:
+            return dim
+        return 768
+
     dim = getattr(getattr(clip_model, "config", None), "projection_dim", None)
     if isinstance(dim, int) and dim > 0:
         return dim
@@ -336,7 +425,7 @@ def _get_clip_image_feature_dim(clip_model, backbone_type: str) -> int:
 
 def _get_clip_text_feature_dim(clip_model, backbone_type: str) -> int:
     text_model = clip_model
-    if backbone_type == "dinov2" and hasattr(clip_model, "text_model"):
+    if backbone_type in {"dinov2", "instructblip"} and hasattr(clip_model, "text_model"):
         text_model = clip_model.text_model
 
     dim = getattr(getattr(text_model, "config", None), "projection_dim", None)
@@ -367,6 +456,31 @@ def _rel_path_to_label_source(rel_path: str) -> Tuple[int, str]:
                 break
 
     return label, source
+
+
+def _normalize_generator_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parts = value
+    else:
+        parts = str(value).replace(";", ",").split(",")
+    return [str(v).strip().upper() for v in parts if str(v).strip()]
+
+
+def _filter_rel_paths_by_generators(rel_paths: Sequence[str], generators: Sequence[str]) -> List[str]:
+    if not generators:
+        return list(rel_paths)
+    gen_set = {g.upper() for g in generators}
+    filtered = []
+    for rel in rel_paths:
+        _, source = _rel_path_to_label_source(rel)
+        src_upper = str(source).upper()
+        if src_upper.startswith("MLS"):
+            src_upper = "MLS"
+        if src_upper in gen_set:
+            filtered.append(rel)
+    return filtered
 
 
 class ImagePathDataset(Dataset):
@@ -616,9 +730,18 @@ class SpectralAnomalyScorer:
     """
     TARGET_SIZE = (224, 224)
 
-    def __init__(self):
+    def __init__(self, high_freq_power: float = 0.0):
         self.mean_spectrum: np.ndarray | None = None
         self.n_bins: int = 0
+        self.high_freq_power = float(high_freq_power)
+        self.weights: np.ndarray | None = None
+
+    def _build_weights(self) -> None:
+        if self.high_freq_power <= 0.0 or self.n_bins <= 0:
+            self.weights = None
+            return
+        r = np.linspace(0.0, 1.0, self.n_bins, dtype=np.float32)
+        self.weights = np.power(r, self.high_freq_power)
 
     def _azimuthal_power_spectrum(self, img: Image.Image) -> np.ndarray:
         gray = img.convert("L").resize(self.TARGET_SIZE, Image.BILINEAR)
@@ -645,6 +768,7 @@ class SpectralAnomalyScorer:
         arr = np.stack(spectra, axis=0)
         self.mean_spectrum = arr.mean(axis=0)
         self.n_bins = self.mean_spectrum.shape[0]
+        self._build_weights()
 
     def score(self, images: List[Image.Image]) -> np.ndarray:
         if self.mean_spectrum is None:
@@ -652,7 +776,10 @@ class SpectralAnomalyScorer:
         scores = []
         for img in images:
             s = self._azimuthal_power_spectrum(img)
-            deviation = float(np.linalg.norm(s - self.mean_spectrum))
+            diff = s - self.mean_spectrum
+            if self.weights is not None:
+                diff = diff * self.weights
+            deviation = float(np.linalg.norm(diff))
             scores.append(deviation)
         return np.array(scores, dtype=np.float32)
 
@@ -660,14 +787,16 @@ class SpectralAnomalyScorer:
         return {
             "mean_spectrum": self.mean_spectrum.tolist() if self.mean_spectrum is not None else None,
             "n_bins": self.n_bins,
+            "high_freq_power": self.high_freq_power,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SpectralAnomalyScorer":
-        obj = cls()
+        obj = cls(high_freq_power=float(d.get("high_freq_power", 0.0)))
         if d.get("mean_spectrum") is not None:
             obj.mean_spectrum = np.array(d["mean_spectrum"], dtype=np.float32)
             obj.n_bins = int(d.get("n_bins", obj.mean_spectrum.shape[0]))
+            obj._build_weights()
         return obj
 
 
@@ -991,7 +1120,7 @@ def save_confusion_matrix(labels, preds, title, out_path):
 
 def write_summary_csv(rows: List[Dict], out_csv: Path) -> None:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
+    base_fieldnames = [
         "geometry",
         "test_set",
         "n_real",
@@ -1011,6 +1140,33 @@ def write_summary_csv(rows: List[Dict], out_csv: Path) -> None:
         "sensitivity_youden_j",
         "specificity_youden_j",
     ]
+
+    # Dynamically include fixed-FPR threshold metrics (e.g., accuracy_fpr_1)
+    # while keeping a stable and readable column order.
+    metric_prefixes = ["accuracy", "f1", "sensitivity", "specificity"]
+    fpr_thresholds = set()
+    for row in rows:
+        for k in row.keys():
+            for prefix in metric_prefixes:
+                p = prefix + "_"
+                if k.startswith(p + "fpr_"):
+                    fpr_thresholds.add(k[len(p):])
+    def _fpr_sort_key(name: str):
+        # name like "fpr_1", "fpr_5", ...
+        try:
+            return int(name.split("_", 1)[1])
+        except Exception:
+            return 10**9
+
+    ordered_fpr_thresholds = sorted(fpr_thresholds, key=_fpr_sort_key)
+    fpr_fieldnames = []
+    for th_name in ordered_fpr_thresholds:
+        for prefix in metric_prefixes:
+            fpr_fieldnames.append(f"{prefix}_{th_name}")
+
+    existing = set(base_fieldnames) | set(fpr_fieldnames)
+    extra_fieldnames = sorted({k for row in rows for k in row.keys()} - existing)
+    fieldnames = base_fieldnames + fpr_fieldnames + extra_fieldnames
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -1022,6 +1178,14 @@ def configure_clip_trainability(clip_model, vision_mode: str, backbone_type: str
     train_vision = vision_mode != "frozen"
 
     if backbone_type == "dinov2":
+        for p in clip_model.parameters():
+            p.requires_grad = False
+        if hasattr(clip_model, "image_model"):
+            for p in clip_model.image_model.parameters():
+                p.requires_grad = train_vision
+        return
+
+    if backbone_type == "instructblip":
         for p in clip_model.parameters():
             p.requires_grad = False
         if hasattr(clip_model, "image_model"):
@@ -1073,7 +1237,7 @@ GAN_STYLE_FAKE_PROMPTS = [
 
 def encode_text_features(clip_model, processor, texts: List[str], device: torch.device, backbone_type: str) -> torch.Tensor:
     with torch.no_grad():
-        if backbone_type == "dinov2":
+        if backbone_type in {"dinov2", "instructblip"}:
             text_processor = processor["text"] if isinstance(processor, dict) else processor
             inputs = text_processor(text=texts, return_tensors="pt", padding=True, truncation=True)
             inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -1259,6 +1423,9 @@ def compute_prototype_fake_gan_image(
     geometry: str,
     backbone_type: str,
     n_aug_samples: int = 200,
+    num_prototypes: int = 1,
+    min_ops: int = 2,
+    max_ops: int = 4,
     seed: int = 42,
 ) -> torch.Tensor:
     """
@@ -1270,7 +1437,7 @@ def compute_prototype_fake_gan_image(
     clip_model.eval()
     projection_head.eval()
     rng = random.Random(seed)
-    augmentor = GANLikeAugmentor(prob=1.0, min_ops=2, max_ops=4)
+    augmentor = GANLikeAugmentor(prob=1.0, min_ops=min_ops, max_ops=max_ops)
 
     all_indices = list(range(len(train_dataset)))
     chosen = rng.sample(all_indices, k=min(n_aug_samples, len(all_indices)))
@@ -1286,9 +1453,112 @@ def compute_prototype_fake_gan_image(
         image_embs.append(_project_image(projection_head, feats).detach())
 
     all_embs = torch.cat(image_embs, dim=0)
+    k = int(max(1, min(num_prototypes, all_embs.shape[0])))
+    if k <= 1:
+        if geometry == "hyperbolic":
+            return frechet_mean_iterative(all_embs, projection_head.curvature)
+        return all_embs.mean(dim=0)
+
     if geometry == "hyperbolic":
-        return frechet_mean_iterative(all_embs, projection_head.curvature)
-    return all_embs.mean(dim=0)
+        tangent = projection_head.ball.logmap0(all_embs)
+        assignments = _kmeans_torch(tangent, k)
+    else:
+        assignments = _kmeans_torch(all_embs, k)
+
+    clusters = []
+    for j in range(k):
+        pts = all_embs[assignments == j]
+        if pts.numel() == 0:
+            clusters.append(all_embs.mean(dim=0))
+            continue
+        if geometry == "hyperbolic":
+            clusters.append(frechet_mean_iterative(pts, projection_head.curvature))
+        else:
+            clusters.append(pts.mean(dim=0))
+
+    return torch.stack(clusters, dim=0)
+
+
+@torch.no_grad()
+def compute_prototype_fake_from_calibration_images(
+    clip_model,
+    processor,
+    projection_head,
+    dataset_root: Path,
+    rel_paths: Sequence[str],
+    batch_size: int,
+    device: torch.device,
+    geometry: str,
+    backbone_type: str,
+    n_samples: int = 200,
+    num_prototypes: int = 1,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Builds fake prototype(s) from calibration fake images (GAN/LDM/MLS) to anchor
+    the fake side with real artifacts without touching test fakes.
+    """
+    if not rel_paths:
+        raise RuntimeError("No calibration fake images available for prototype building.")
+
+    rng = random.Random(seed)
+    chosen = rng.sample(list(rel_paths), k=min(n_samples, len(rel_paths)))
+
+    clip_model.eval()
+    projection_head.eval()
+    image_embs = []
+    for start in range(0, len(chosen), batch_size):
+        batch_paths = chosen[start:start + batch_size]
+        imgs = [Image.open(dataset_root / rel).convert("RGB") for rel in batch_paths]
+        feats = _encode_image_features(clip_model, processor, imgs, device, backbone_type)
+        image_embs.append(_project_image(projection_head, feats).detach())
+
+    all_embs = torch.cat(image_embs, dim=0)
+    k = int(max(1, min(num_prototypes, all_embs.shape[0])))
+    if k <= 1:
+        if geometry == "hyperbolic":
+            return frechet_mean_iterative(all_embs, projection_head.curvature)
+        return all_embs.mean(dim=0)
+
+    if geometry == "hyperbolic":
+        tangent = projection_head.ball.logmap0(all_embs)
+        assignments = _kmeans_torch(tangent, k)
+    else:
+        assignments = _kmeans_torch(all_embs, k)
+
+    clusters = []
+    for j in range(k):
+        pts = all_embs[assignments == j]
+        if pts.numel() == 0:
+            clusters.append(all_embs.mean(dim=0))
+            continue
+        if geometry == "hyperbolic":
+            clusters.append(frechet_mean_iterative(pts, projection_head.curvature))
+        else:
+            clusters.append(pts.mean(dim=0))
+
+    return torch.stack(clusters, dim=0)
+
+
+def _combine_fake_prototypes(*prototypes: torch.Tensor | None) -> torch.Tensor:
+    mats = []
+    ref_device = None
+    for proto in prototypes:
+        if proto is None:
+            continue
+        if ref_device is None:
+            ref_device = proto.device
+        if proto.device != ref_device:
+            proto = proto.to(ref_device)
+        mats.append(proto.unsqueeze(0) if proto.ndim == 1 else proto)
+
+    if not mats:
+        raise RuntimeError("No fake prototypes available to combine.")
+
+    combined = torch.cat(mats, dim=0)
+    if combined.shape[0] == 1:
+        return combined[0]
+    return combined
 
 
 @torch.no_grad()
@@ -1522,8 +1792,12 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     backbone_model_name = cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16")
     clip_model_name = cfg.get("clip_model_name", backbone_model_name)
     text_model_name = cfg.get("clip_text_model_name", clip_model_name)
-    if backbone_type == "dinov2":
+    if backbone_type in {"dinov2", "instructblip"}:
         clip_model_name = backbone_model_name
+        if not cfg.get("clip_text_model_name"):
+            raise RuntimeError(
+                "backbone.type is set to a non-CLIP image backbone; please set clip_text_model_name to a CLIP checkpoint."
+            )
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     batch_size = int(cfg.get("batch_size", 32))
     epochs = int(cfg.get("epochs", 10))
@@ -1546,12 +1820,23 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     hard_negative_weight = float(cfg.get("hard_negative_weight", 1.0))
     fake_num_prototypes = int(cfg.get("fake_num_prototypes", 2))
     enable_gan_prompt_enrichment = bool(cfg.get("enable_gan_prompt_enrichment", True))
+    gan_prompt_multiplier = int(cfg.get("gan_prompt_multiplier", 1))
     gan_like_augment_prob = float(cfg.get("gan_like_augment_prob", 0.35))
     fixed_fpr_targets = cfg.get("fixed_fpr_targets", [0.01, 0.05, 0.10])
     fixed_fpr_targets = [float(v) for v in fixed_fpr_targets if 0.0 < float(v) < 1.0]
     lambda_spectral = float(cfg.get("lambda_spectral", 0.3))
+    spectral_high_freq_power = float(cfg.get("spectral_high_freq_power", 0.0))
     enable_gan_image_prototype = bool(cfg.get("enable_gan_image_prototype", True))
     gan_image_prototype_samples = int(cfg.get("gan_image_prototype_samples", 200))
+    gan_image_prototype_num_prototypes = int(cfg.get("gan_image_prototype_num_prototypes", 1))
+    gan_image_prototype_min_ops = int(cfg.get("gan_image_prototype_min_ops", 2))
+    gan_image_prototype_max_ops = int(cfg.get("gan_image_prototype_max_ops", 4))
+    enable_calibration_fake_prototype = bool(cfg.get("enable_calibration_fake_prototype", False))
+    calibration_fake_generators = _normalize_generator_list(
+        cfg.get("calibration_fake_prototype_generators")
+    )
+    calibration_fake_prototype_samples = int(cfg.get("calibration_fake_prototype_samples", 200))
+    calibration_fake_num_prototypes = int(cfg.get("calibration_fake_num_prototypes", 1))
 
     set_global_determinism(seed)
 
@@ -1567,7 +1852,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
     text_dim = _get_clip_text_feature_dim(clip_model, backbone_type)
 
-    if backbone_type == "dinov2":
+    if backbone_type in {"dinov2", "instructblip"}:
         projection_head = SharedProjectionHead(
             image_input_dim=feature_dim,
             text_input_dim=text_dim,
@@ -1591,7 +1876,8 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         prompt_path = PROJECT_ROOT / prompt_path
     real_prompts_pool, fake_prompts_pool = load_prompts(prompt_path)
     if enable_gan_prompt_enrichment:
-        fake_prompts_pool = list(fake_prompts_pool) + GAN_STYLE_FAKE_PROMPTS
+        multiplier = max(1, int(gan_prompt_multiplier))
+        fake_prompts_pool = list(fake_prompts_pool) + (GAN_STYLE_FAKE_PROMPTS * multiplier)
     n_train = len(fold["train_ids"])
     real_prompts_fold = list(itertools.islice(itertools.cycle(real_prompts_pool), n_train))
     fake_prompts_fold = list(itertools.islice(itertools.cycle(fake_prompts_pool), n_train))
@@ -1626,7 +1912,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
     # Fit spectral scorer on real training images (one-time, before training loop)
     print(f"  [{geometry}] Fitting spectral anomaly scorer on {len(train_ds)} training images...", flush=True)
-    spectral_scorer = SpectralAnomalyScorer()
+    spectral_scorer = SpectralAnomalyScorer(high_freq_power=spectral_high_freq_power)
     train_images_for_spectral = []
     for i in range(len(train_ds)):
         img = Image.open(dataset_root / train_ds.rel_paths[i]).convert("RGB")
@@ -1643,6 +1929,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
 
     # GAN image prototype computed once after warmup
     p_fake_gan_img = None
+    p_fake_calibration = None
     p_fake_combined = None
 
     best_auroc = -1.0
@@ -1694,6 +1981,9 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 geometry,
                 backbone_type,
                 n_aug_samples=gan_image_prototype_samples,
+                num_prototypes=gan_image_prototype_num_prototypes,
+                min_ops=gan_image_prototype_min_ops,
+                max_ops=gan_image_prototype_max_ops,
                 seed=seed,
             )
             print(
@@ -1701,14 +1991,35 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 flush=True,
             )
 
-        if enable_gan_image_prototype and p_fake_gan_img is not None:
-            p_fake_gan_img_dev = p_fake_gan_img.to(device)
-            if p_fake.ndim == 1:
-                p_fake_combined = torch.stack([p_fake, p_fake_gan_img_dev], dim=0)
-            else:
-                p_fake_combined = torch.cat([p_fake, p_fake_gan_img_dev.unsqueeze(0)], dim=0)
-        else:
-            p_fake_combined = p_fake
+        if epoch == warmup_epochs + 1 and enable_calibration_fake_prototype:
+            calib_ids = fold.get("calibration_fake_ids", [])
+            calib_ids = _filter_rel_paths_by_generators(calib_ids, calibration_fake_generators)
+            if calib_ids:
+                print(
+                    f"  [{geometry}] fold={fold['fold_index']} epoch={epoch} - computing calibration fake prototype",
+                    flush=True,
+                )
+                p_fake_calibration = compute_prototype_fake_from_calibration_images(
+                    clip_model,
+                    processor,
+                    projection_head,
+                    dataset_root,
+                    calib_ids,
+                    batch_size,
+                    device,
+                    geometry,
+                    backbone_type,
+                    n_samples=calibration_fake_prototype_samples,
+                    num_prototypes=calibration_fake_num_prototypes,
+                    seed=seed,
+                )
+                print(
+                    f"  [{geometry}] fold={fold['fold_index']} calibration fake prototype computed, "
+                    f"shape={tuple(p_fake_calibration.shape)}",
+                    flush=True,
+                )
+
+        p_fake_combined = _combine_fake_prototypes(p_fake, p_fake_gan_img, p_fake_calibration)
 
         train_loss = train_one_epoch_multimodal(
             clip_model,
@@ -1752,14 +2063,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             fake_num_prototypes,
         )
 
-        if enable_gan_image_prototype and p_fake_gan_img is not None:
-            p_fake_gan_img_dev = p_fake_gan_img.to(device)
-            if p_fake.ndim == 1:
-                p_fake_combined = torch.stack([p_fake, p_fake_gan_img_dev], dim=0)
-            else:
-                p_fake_combined = torch.cat([p_fake, p_fake_gan_img_dev.unsqueeze(0)], dim=0)
-        else:
-            p_fake_combined = p_fake
+        p_fake_combined = _combine_fake_prototypes(p_fake, p_fake_gan_img, p_fake_calibration)
 
         if geometry == "hyperbolic":
             # ensure prototypes are on the same device as the projection head/ball
@@ -1794,6 +2098,16 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         mu_spectral = float(np.mean(val_in_spectral))
         sigma_spectral = float(max(np.std(val_in_spectral), 0.05))
 
+        # Thresholds should be calibrated on the same score space used at eval time.
+        # When spectral fusion is enabled, default/fixed-FPR thresholds must be computed
+        # from the fused (z-scored) val_in distribution, not the raw spatial scores.
+        if lambda_spectral > 0.0:
+            z_spatial_in = (val_in_scores - mu_spatial) / (sigma_spatial + 1e-8)
+            z_spectral_in = (val_in_spectral - mu_spectral) / (sigma_spectral + 1e-8)
+            val_in_scores_for_thresholds = (1.0 - lambda_spectral) * z_spatial_in + lambda_spectral * z_spectral_in
+        else:
+            val_in_scores_for_thresholds = val_in_scores
+
         if epoch == 1 or epoch == warmup_epochs + 1:
             print(
                 f"  [{geometry}] fold={fold['fold_index']} epoch={epoch} "
@@ -1813,7 +2127,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
             lambda_spectral=lambda_spectral,
         )
 
-        default_threshold = max(float(np.percentile(val_in_scores, threshold_percentile)), 0.0)
+        default_threshold = float(np.percentile(val_in_scores_for_thresholds, threshold_percentile))
         best_f1, best_j = calibrate_threshold(val_eval_labels, val_eval_scores)
         threshold_map = {
             "default": float(default_threshold),
@@ -1822,7 +2136,7 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
         }
         for fpr in fixed_fpr_targets:
             key = f"fpr_{int(round(fpr * 100.0))}"
-            threshold_map[key] = float(np.quantile(val_in_scores, 1.0 - fpr))
+            threshold_map[key] = float(np.quantile(val_in_scores_for_thresholds, 1.0 - fpr))
 
         val_metrics = {name: compute_metrics(val_eval_labels, val_eval_scores, th) for name, th in threshold_map.items()}
 
@@ -1835,7 +2149,8 @@ def run_fold(cfg: dict, dataset_root: Path, geometry: str, fold: Dict, fold_dir:
                 "projection_head": projection_head.state_dict(),
                 "p_real": p_real.detach().cpu(),
                 "p_fake": p_fake_combined.detach().cpu(),
-                "val_real_scores": val_in_scores.tolist(),
+                "val_real_scores": val_in_scores_for_thresholds.tolist(),
+                "val_real_scores_spatial": val_in_scores.tolist(),
                 "spectral_scorer": spectral_scorer.to_dict(),
                 "mu_spatial": mu_spatial,
                 "sigma_spatial": sigma_spatial,
@@ -1996,8 +2311,12 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     backbone_model_name = cfg.get("backbone", {}).get("model_name", "openai/clip-vit-base-patch16")
     clip_model_name = cfg.get("clip_model_name", backbone_model_name)
     text_model_name = cfg.get("clip_text_model_name", clip_model_name)
-    if backbone_type == "dinov2":
+    if backbone_type in {"dinov2", "instructblip"}:
         clip_model_name = backbone_model_name
+        if not cfg.get("clip_text_model_name"):
+            raise RuntimeError(
+                "backbone.type is set to a non-CLIP image backbone; please set clip_text_model_name to a CLIP checkpoint."
+            )
     open_clip_pretrained = cfg.get("backbone", {}).get("open_clip_pretrained", "openai")
     projection_dim = int(cfg.get("projection_dim", 256))
     curvature = float(cfg.get("curvature", 1.0))
@@ -2017,7 +2336,7 @@ def load_best_model(cfg: dict, geometry: str, checkpoint_path: Path, device: tor
     feature_dim = _get_clip_image_feature_dim(clip_model, backbone_type)
     text_dim = _get_clip_text_feature_dim(clip_model, backbone_type)
 
-    if backbone_type == "dinov2":
+    if backbone_type in {"dinov2", "instructblip"}:
         projection_head = SharedProjectionHead(
             image_input_dim=feature_dim,
             text_input_dim=text_dim,
@@ -2210,28 +2529,35 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         with (test_dir / "results.json").open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
-        summary_rows.append(
-            {
-                "geometry": geometry,
-                "test_set": test_name,
-                "n_real": test_spec["n_real"],
-                "n_fake": test_spec["n_fake"],
-                "auroc": round(result["auroc"], 6),
-                "auprc": round(result["auprc"], 6),
-                "accuracy_default": round(result["threshold_results"]["default"]["accuracy"], 6),
-                "f1_default": round(result["threshold_results"]["default"]["f1"], 6),
-                "sensitivity_default": round(result["threshold_results"]["default"]["sensitivity"], 6),
-                "specificity_default": round(result["threshold_results"]["default"]["specificity"], 6),
-                "accuracy_f1": round(result["threshold_results"]["f1"]["accuracy"], 6),
-                "f1_f1": round(result["threshold_results"]["f1"]["f1"], 6),
-                "sensitivity_f1": round(result["threshold_results"]["f1"]["sensitivity"], 6),
-                "specificity_f1": round(result["threshold_results"]["f1"]["specificity"], 6),
-                "accuracy_youden_j": round(result["threshold_results"]["youden_j"]["accuracy"], 6),
-                "f1_youden_j": round(result["threshold_results"]["youden_j"]["f1"], 6),
-                "sensitivity_youden_j": round(result["threshold_results"]["youden_j"]["sensitivity"], 6),
-                "specificity_youden_j": round(result["threshold_results"]["youden_j"]["specificity"], 6),
-            }
-        )
+        row = {
+            "geometry": geometry,
+            "test_set": test_name,
+            "n_real": test_spec["n_real"],
+            "n_fake": test_spec["n_fake"],
+            "auroc": round(result["auroc"], 6),
+            "auprc": round(result["auprc"], 6),
+            "accuracy_default": round(result["threshold_results"]["default"]["accuracy"], 6),
+            "f1_default": round(result["threshold_results"]["default"]["f1"], 6),
+            "sensitivity_default": round(result["threshold_results"]["default"]["sensitivity"], 6),
+            "specificity_default": round(result["threshold_results"]["default"]["specificity"], 6),
+            "accuracy_f1": round(result["threshold_results"]["f1"]["accuracy"], 6),
+            "f1_f1": round(result["threshold_results"]["f1"]["f1"], 6),
+            "sensitivity_f1": round(result["threshold_results"]["f1"]["sensitivity"], 6),
+            "specificity_f1": round(result["threshold_results"]["f1"]["specificity"], 6),
+            "accuracy_youden_j": round(result["threshold_results"]["youden_j"]["accuracy"], 6),
+            "f1_youden_j": round(result["threshold_results"]["youden_j"]["f1"], 6),
+            "sensitivity_youden_j": round(result["threshold_results"]["youden_j"]["sensitivity"], 6),
+            "specificity_youden_j": round(result["threshold_results"]["youden_j"]["specificity"], 6),
+        }
+        for th_name in thresholds.keys():
+            if not str(th_name).startswith("fpr_"):
+                continue
+            tm = result["threshold_results"][th_name]
+            row[f"accuracy_{th_name}"] = round(tm["accuracy"], 6)
+            row[f"f1_{th_name}"] = round(tm["f1"], 6)
+            row[f"sensitivity_{th_name}"] = round(tm["sensitivity"], 6)
+            row[f"specificity_{th_name}"] = round(tm["specificity"], 6)
+        summary_rows.append(row)
 
     with (geometry_dir / "per_image_scores.json").open("w", encoding="utf-8") as f:
         json.dump(per_image_scores_payload, f, indent=2)
@@ -2248,6 +2574,11 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         json.dump({"best_fold": best_fold, "tests": test_results}, f, indent=2)
 
     all_fold_results = {}
+    fpr_threshold_names = sorted(
+        [k for k in thresholds.keys() if str(k).startswith("fpr_")],
+        key=_threshold_order_key,
+    )
+
     fold_metric_names = [
         "auroc",
         "auprc",
@@ -2264,6 +2595,15 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
         "sensitivity_youden_j",
         "specificity_youden_j",
     ]
+    for th_name in fpr_threshold_names:
+        fold_metric_names.extend(
+            [
+                f"accuracy_{th_name}",
+                f"f1_{th_name}",
+                f"sensitivity_{th_name}",
+                f"specificity_{th_name}",
+            ]
+        )
 
     for fold_summary in fold_summaries:
         fold_index = fold_summary["fold_index"]
@@ -2317,6 +2657,11 @@ def run_geometry(cfg: dict, manifest: dict, dataset_root: Path, geometry: str, g
                 "sensitivity_youden_j": result["threshold_results"]["youden_j"]["sensitivity"],
                 "specificity_youden_j": result["threshold_results"]["youden_j"]["specificity"],
             }
+            for th_name in fpr_threshold_names:
+                fold_metrics[f"accuracy_{th_name}"] = result["threshold_results"][th_name]["accuracy"]
+                fold_metrics[f"f1_{th_name}"] = result["threshold_results"][th_name]["f1"]
+                fold_metrics[f"sensitivity_{th_name}"] = result["threshold_results"][th_name]["sensitivity"]
+                fold_metrics[f"specificity_{th_name}"] = result["threshold_results"][th_name]["specificity"]
             all_fold_results[fold_index][test_name] = fold_metrics
 
     mean_std_rows = []
@@ -2552,27 +2897,8 @@ def main() -> int:
                     {
                         k: v
                         for k, v in row.items()
-                        if k
-                        in {
-                            "geometry",
-                            "test_set",
-                            "n_real",
-                            "n_fake",
-                            "auroc",
-                            "auprc",
-                            "accuracy_default",
-                            "f1_default",
-                            "sensitivity_default",
-                            "specificity_default",
-                            "accuracy_f1",
-                            "f1_f1",
-                            "sensitivity_f1",
-                            "specificity_f1",
-                            "accuracy_youden_j",
-                            "f1_youden_j",
-                            "sensitivity_youden_j",
-                            "specificity_youden_j",
-                        }
+                        if k in {"geometry", "test_set", "n_real", "n_fake", "auroc", "auprc"}
+                        or k.startswith(("accuracy_", "f1_", "sensitivity_", "specificity_"))
                     }
                     for row in all_summary_rows
                 ],
@@ -2633,6 +2959,10 @@ def main() -> int:
             "sensitivity_youden_j",
             "specificity_youden_j",
         ]
+
+        # Include any additional metric columns (e.g., fixed-FPR metrics) if present.
+        extra_fieldnames = sorted({k for row in multi_backbone_rows for k in row.keys()} - set(fieldnames))
+        fieldnames = fieldnames + extra_fieldnames
         with (run_dir / "final_multi_backbone_summary.csv").open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()

@@ -1,4 +1,5 @@
 transformers>=4.40.0
+sentencepiece>=0.2.0
 geoopt>=0.5.0
 numpy>=1.26,<2.0
 scipy>=1.11,<1.13
