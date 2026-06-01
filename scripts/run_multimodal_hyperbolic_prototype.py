@@ -274,7 +274,7 @@ class InstructBlipImageEncoder(nn.Module):
             return_dict=True,
         )
         query_features = qformer_outputs.last_hidden_state
-        return query_features.mean(dim=1)
+        return query_features.mean(dim=1).float()
 
 
 class InstructBlipWithClipText(nn.Module):
