@@ -255,7 +255,19 @@ class InstructBlipImageEncoder(nn.Module):
             image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device
         )
         query_tokens_expanded = query_tokens.expand(image_embeds.shape[0], -1, -1)
+        bos_token_id = getattr(getattr(qformer, "config", None), "bos_token_id", None)
+        if bos_token_id is None:
+            bos_token_id = getattr(getattr(qformer, "config", None), "pad_token_id", 0)
+        input_ids = torch.full(
+            (image_embeds.shape[0], 1),
+            int(bos_token_id),
+            dtype=torch.long,
+            device=image_embeds.device,
+        )
+        attention_mask = torch.ones_like(input_ids)
         qformer_outputs = qformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             query_embeds=query_tokens_expanded,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_attention_mask,
